@@ -10,10 +10,13 @@ class AppState: ObservableObject {
     @Published var loadingStatus = ""
     @Published var currentText = ""
     @Published var suggestion = ""
+    @Published var suggestionBase = ""
+    @Published var suggestionOffset = 0
     @Published var metrics: CompletionMetrics?
     @Published var modelPath: String?
 
     private var inferenceTask: Task<Void, Never>?
+    private var lastText = ""
 
     func loadModel(path: String) async {
         isLoading = true
@@ -36,13 +39,51 @@ class AppState: ObservableObject {
     }
 
     func onTextChange(_ newText: String) {
+        let previousText = lastText
+        logEvent("textChange", [
+            "prev": previousText,
+            "new": newText,
+            "suggestion": suggestion,
+            "base": suggestionBase,
+            "offset": "\(suggestionOffset)"
+        ])
+        if shouldKeepSuggestionOnTrailingWhitespace(previousText: previousText, newText: newText) {
+            inferenceTask?.cancel()
+            currentText = newText
+            lastText = newText
+            logEvent("keepSuggestion.trailingWhitespace", [
+                "typed": String(newText.dropFirst(previousText.count))
+            ])
+            return
+        }
+        if shouldKeepSuggestionAlive(previousText: previousText, newText: newText) {
+            inferenceTask?.cancel()
+            lastText = newText
+            logEvent("keepSuggestion.matching", [
+                "typed": String(newText.dropFirst(previousText.count)),
+                "remaining": String(suggestionBase.dropFirst(suggestionOffset))
+            ])
+            return
+        }
+
         currentText = newText
+        lastText = newText
 
         inferenceTask?.cancel()
 
         // Clear suggestion immediately if text is empty
         if newText.isEmpty {
             suggestion = ""
+            suggestionBase = ""
+            suggestionOffset = 0
+            metrics = nil
+            lastText = ""
+            return
+        }
+        if !hasCompletedWord(newText) {
+            suggestion = ""
+            suggestionBase = ""
+            suggestionOffset = 0
             metrics = nil
             return
         }
@@ -57,6 +98,10 @@ class AppState: ObservableObject {
         guard let engine = engine else { return }
 
         let modelPrompt = trimTrailingSpaces(text)
+        logEvent("requestCompletion", [
+            "text": text,
+            "modelPrompt": modelPrompt
+        ])
         let (completion, completionMetrics) = await engine.getCompletion(
             prompt: modelPrompt,
             inputText: text,
@@ -65,22 +110,56 @@ class AppState: ObservableObject {
 
         // Only update if text hasn't changed
         if text == currentText {
-            suggestion = sanitizeSuggestion(completion, forPrompt: text)
+            let sanitized = sanitizeSuggestion(completion, forPrompt: text)
+            suggestionBase = sanitized
+            suggestionOffset = 0
+            suggestion = sanitized
+            logEvent("completionReceived", [
+                "raw": completion,
+                "sanitized": sanitized
+            ])
             metrics = completionMetrics
         }
     }
 
-    func acceptSuggestion() {
-        guard !suggestion.isEmpty else { return }
+    func acceptSuggestion() -> String {
+        guard !suggestion.isEmpty else { return "" }
 
         // Accept first word only, no artificial spaces
         let firstWord = firstWordWithLeadingWhitespace(from: suggestion)
         currentText += firstWord
         suggestion = ""
+        suggestionBase = ""
+        suggestionOffset = 0
         metrics = nil
 
         // Trigger new completion
         onTextChange(currentText)
+        return firstWord
+    }
+
+    func acceptAllSuggestion() -> String {
+        guard !suggestion.isEmpty else { return "" }
+
+        let accepted = suggestion
+        currentText += suggestion
+        suggestion = ""
+        suggestionBase = ""
+        suggestionOffset = 0
+        metrics = nil
+
+        // Trigger new completion
+        onTextChange(currentText)
+        return accepted
+    }
+
+    func regenerateAfterDeletingAcceptedSuggestion(newText: String) {
+        suggestion = ""
+        suggestionBase = ""
+        suggestionOffset = 0
+        metrics = nil
+        lastText = ""
+        onTextChange(newText)
     }
 
     private func sanitizeSuggestion(_ suggestion: String, forPrompt prompt: String) -> String {
@@ -142,6 +221,63 @@ class AppState: ObservableObject {
         }
 
         return String(suggestion[..<end])
+    }
+
+    private func shouldKeepSuggestionAlive(previousText: String, newText: String) -> Bool {
+        guard !suggestionBase.isEmpty else { return false }
+        guard newText.count >= previousText.count else { return false }
+        guard newText.hasPrefix(previousText) else { return false }
+
+        let typedStart = newText.index(newText.startIndex, offsetBy: previousText.count)
+        let typed = String(newText[typedStart...])
+        if typed.isEmpty { return false }
+
+        let remaining = String(suggestionBase.dropFirst(suggestionOffset))
+        if remaining.hasPrefix(typed) {
+            suggestionOffset += typed.count
+            suggestion = String(suggestionBase.dropFirst(suggestionOffset))
+            currentText = newText
+            return true
+        }
+
+        return false
+    }
+
+    private func shouldKeepSuggestionOnTrailingWhitespace(previousText: String, newText: String) -> Bool {
+        guard !suggestionBase.isEmpty else { return false }
+        guard newText.count > previousText.count else { return false }
+        guard newText.hasPrefix(previousText) else { return false }
+
+        let typedStart = newText.index(newText.startIndex, offsetBy: previousText.count)
+        let typed = newText[typedStart...]
+        if typed.isEmpty { return false }
+        guard typed.allSatisfy({ $0 == " " || $0 == "\t" }) else { return false }
+
+        let remaining = String(suggestionBase.dropFirst(suggestionOffset))
+        if remaining.hasPrefix(typed) {
+            suggestionOffset += typed.count
+            suggestion = String(suggestionBase.dropFirst(suggestionOffset))
+        }
+        return true
+    }
+
+    private func logEvent(_ name: String, _ data: [String: String]) {
+        #if DEBUG
+        let payload = data.map { "\($0.key)=\($0.value.debugDescription)" }.sorted().joined(separator: " ")
+        print("[Typofast] \(name) \(payload)")
+        #endif
+    }
+
+    private func hasCompletedWord(_ text: String) -> Bool {
+        var inWord = false
+        for ch in text {
+            if ch.isWhitespace {
+                if inWord { return true }
+            } else {
+                inWord = true
+            }
+        }
+        return false
     }
 
     func clearAll() async {
@@ -220,7 +356,9 @@ struct ContentView: View {
                     text: $appState.currentText,
                     suggestion: appState.suggestion,
                     onTextChange: { appState.onTextChange($0) },
-                    onAcceptSuggestion: { appState.acceptSuggestion() }
+                    onAcceptSuggestion: { appState.acceptSuggestion() },
+                    onAcceptAllSuggestion: { appState.acceptAllSuggestion() },
+                    onDeleteAcceptedSuggestion: { appState.regenerateAfterDeletingAcceptedSuggestion(newText: $0) }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -267,7 +405,9 @@ struct TextEditorWithSuggestions: NSViewRepresentable {
     @Binding var text: String
     let suggestion: String
     let onTextChange: (String) -> Void
-    let onAcceptSuggestion: () -> Void
+    let onAcceptSuggestion: () -> String
+    let onAcceptAllSuggestion: () -> String
+    let onDeleteAcceptedSuggestion: (String) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
@@ -304,23 +444,37 @@ struct TextEditorWithSuggestions: NSViewRepresentable {
         Coordinator(
             text: $text,
             onTextChange: onTextChange,
-            onAcceptSuggestion: onAcceptSuggestion
+            onAcceptSuggestion: onAcceptSuggestion,
+            onAcceptAllSuggestion: onAcceptAllSuggestion,
+            onDeleteAcceptedSuggestion: onDeleteAcceptedSuggestion
         )
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {
         @Binding var text: String
         let onTextChange: (String) -> Void
-        let onAcceptSuggestion: () -> Void
+        let onAcceptSuggestion: () -> String
+        let onAcceptAllSuggestion: () -> String
+        let onDeleteAcceptedSuggestion: (String) -> Void
 
         weak var textView: NSTextView?
         weak var scrollView: NSScrollView?
         private var suggestionLayer: CATextLayer?
+        private var lastAcceptedRange: NSRange?
+        private var lastAcceptedText = ""
 
-        init(text: Binding<String>, onTextChange: @escaping (String) -> Void, onAcceptSuggestion: @escaping () -> Void) {
+        init(
+            text: Binding<String>,
+            onTextChange: @escaping (String) -> Void,
+            onAcceptSuggestion: @escaping () -> String,
+            onAcceptAllSuggestion: @escaping () -> String,
+            onDeleteAcceptedSuggestion: @escaping (String) -> Void
+        ) {
             self._text = text
             self.onTextChange = onTextChange
             self.onAcceptSuggestion = onAcceptSuggestion
+            self.onAcceptAllSuggestion = onAcceptAllSuggestion
+            self.onDeleteAcceptedSuggestion = onDeleteAcceptedSuggestion
         }
 
         func textDidChange(_ notification: Notification) {
@@ -329,11 +483,36 @@ struct TextEditorWithSuggestions: NSViewRepresentable {
             onTextChange(textView.string)
         }
 
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if replacementString == "@" {
+                let accepted = acceptAllSuggestion(from: textView)
+                return accepted.isEmpty
+            }
+
+            if let replacementString = replacementString, !replacementString.isEmpty {
+                lastAcceptedRange = nil
+                lastAcceptedText = ""
+            }
+            return true
+        }
+
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             // Handle Tab to accept suggestion
             if commandSelector == #selector(NSResponder.insertTab(_:)) {
-                onAcceptSuggestion()
+                _ = acceptSuggestion(from: textView)
                 return true
+            }
+
+            if commandSelector == #selector(NSResponder.deleteBackward(_:)) {
+                if let range = lastAcceptedRange,
+                   textView.selectedRange().location == range.location + range.length {
+                    textView.textStorage?.deleteCharacters(in: range)
+                    text = textView.string
+                    onDeleteAcceptedSuggestion(textView.string)
+                    lastAcceptedRange = nil
+                    lastAcceptedText = ""
+                    return true
+                }
             }
 
             return false
@@ -375,6 +554,26 @@ struct TextEditorWithSuggestions: NSViewRepresentable {
 
             textView.layer?.addSublayer(layer)
             suggestionLayer = layer
+        }
+
+        private func acceptSuggestion(from textView: NSTextView) -> String {
+            let before = textView.selectedRange().location
+            let accepted = onAcceptSuggestion()
+            if !accepted.isEmpty {
+                lastAcceptedRange = NSRange(location: before, length: accepted.count)
+                lastAcceptedText = accepted
+            }
+            return accepted
+        }
+
+        private func acceptAllSuggestion(from textView: NSTextView) -> String {
+            let before = textView.selectedRange().location
+            let accepted = onAcceptAllSuggestion()
+            if !accepted.isEmpty {
+                lastAcceptedRange = NSRange(location: before, length: accepted.count)
+                lastAcceptedText = accepted
+            }
+            return accepted
         }
     }
 }
