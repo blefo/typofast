@@ -6,6 +6,14 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		5B7828A32F0EE1CE0081202D /* llama.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5B7828A12F0EE1BC0081202D /* llama.xcframework */; };
+		5B7828A42F0EE1CE0081202D /* llama.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 5B7828A12F0EE1BC0081202D /* llama.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		583DFAA5DA478B29525144C7 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23EDF75E76063C8B86AE1346 /* Accelerate.framework */; };
+		D8447DAAD48E22CB9743987B /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F7E0C8603A1EA2A5C06CBE99 /* Metal.framework */; };
+		8EDA45FE311638B29681484B /* MetalPerformanceShaders.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 055F8016B254ADF0847A0567 /* MetalPerformanceShaders.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		5B7828842F0ED9ED0081202D /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -23,10 +31,28 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		5B7828A52F0EE1CE0081202D /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				5B7828A42F0EE1CE0081202D /* llama.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		5B7828762F0ED9EC0081202D /* typofast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = typofast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5B7828832F0ED9ED0081202D /* typofastTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = typofastTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		5B78288D2F0ED9ED0081202D /* typofastUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = typofastUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5B7828A12F0EE1BC0081202D /* llama.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = llama.xcframework; sourceTree = "<group>"; };
+		23EDF75E76063C8B86AE1346 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
+		F7E0C8603A1EA2A5C06CBE99 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		055F8016B254ADF0847A0567 /* MetalPerformanceShaders.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShaders.framework; path = System/Library/Frameworks/MetalPerformanceShaders.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,6 +78,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				583DFAA5DA478B29525144C7 /* Accelerate.framework in Frameworks */,
+				D8447DAAD48E22CB9743987B /* Metal.framework in Frameworks */,
+				8EDA45FE311638B29681484B /* MetalPerformanceShaders.framework in Frameworks */,
+				5B7828A32F0EE1CE0081202D /* llama.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -79,6 +109,10 @@
 				5B7828862F0ED9ED0081202D /* typofastTests */,
 				5B7828902F0ED9ED0081202D /* typofastUITests */,
 				5B7828772F0ED9EC0081202D /* Products */,
+				5B7828A12F0EE1BC0081202D /* llama.xcframework */,
+				23EDF75E76063C8B86AE1346 /* Accelerate.framework */,
+				F7E0C8603A1EA2A5C06CBE99 /* Metal.framework */,
+				055F8016B254ADF0847A0567 /* MetalPerformanceShaders.framework */,
 			);
 			sourceTree = "<group>";
 		};
@@ -102,6 +136,7 @@
 				5B7828722F0ED9EC0081202D /* Sources */,
 				5B7828732F0ED9EC0081202D /* Frameworks */,
 				5B7828742F0ED9EC0081202D /* Resources */,
+				5B7828A52F0EE1CE0081202D /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
