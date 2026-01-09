@@ -56,15 +56,16 @@ class AppState: ObservableObject {
     private func requestCompletion(_ text: String) async {
         guard let engine = engine else { return }
 
+        let modelPrompt = trimTrailingSpaces(text)
         let (completion, completionMetrics) = await engine.getCompletion(
-            prompt: text,
+            prompt: modelPrompt,
             inputText: text,
             maxTokens: 6
         )
 
         // Only update if text hasn't changed
         if text == currentText {
-            suggestion = completion
+            suggestion = sanitizeSuggestion(completion, forPrompt: text)
             metrics = completionMetrics
         }
     }
@@ -72,14 +73,75 @@ class AppState: ObservableObject {
     func acceptSuggestion() {
         guard !suggestion.isEmpty else { return }
 
-        // Accept first word
-        let firstWord = suggestion.split(separator: " ").first.map(String.init) ?? suggestion
-        currentText += firstWord + " "
+        // Accept first word only, no artificial spaces
+        let firstWord = firstWordWithLeadingWhitespace(from: suggestion)
+        currentText += firstWord
         suggestion = ""
         metrics = nil
 
         // Trigger new completion
         onTextChange(currentText)
+    }
+
+    private func sanitizeSuggestion(_ suggestion: String, forPrompt prompt: String) -> String {
+        guard !suggestion.isEmpty else { return "" }
+
+        if promptEndsWithSpaceOrTab(prompt) {
+            return trimLeadingWhitespace(suggestion)
+        }
+
+        return suggestion
+    }
+
+    private func trimTrailingSpaces(_ text: String) -> String {
+        var end = text.endIndex
+        while end > text.startIndex {
+            let prev = text.index(before: end)
+            let ch = text[prev]
+            if ch == " " || ch == "\t" {
+                end = prev
+            } else {
+                break
+            }
+        }
+        return String(text[..<end])
+    }
+
+    private func promptEndsWithSpaceOrTab(_ text: String) -> Bool {
+        guard let lastChar = text.last else { return false }
+        return lastChar == " " || lastChar == "\t"
+    }
+
+    private func trimLeadingWhitespace(_ text: String) -> String {
+        var start = text.startIndex
+        while start < text.endIndex {
+            let ch = text[start]
+            if ch == " " || ch == "\t" {
+                start = text.index(after: start)
+            } else {
+                break
+            }
+        }
+        return String(text[start...])
+    }
+
+    private func firstWordWithLeadingWhitespace(from suggestion: String) -> String {
+        var index = suggestion.startIndex
+
+        while index < suggestion.endIndex, suggestion[index].isWhitespace {
+            index = suggestion.index(after: index)
+        }
+
+        if index == suggestion.endIndex {
+            return ""
+        }
+
+        var end = index
+        while end < suggestion.endIndex, !suggestion[end].isWhitespace {
+            end = suggestion.index(after: end)
+        }
+
+        return String(suggestion[..<end])
     }
 
     func clearAll() async {
