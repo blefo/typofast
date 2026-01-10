@@ -1,0 +1,15 @@
+{
+  "originHash" : "38030a62827f45e302050dcd727ecd335206bb4283742002c6f402df9e2946ef",
+  "pins" : [
+    {
+      "identity" : "cursorbounds",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Aeastr/CursorBounds.git",
+      "state" : {
+        "revision" : "cfb5f342ef814c9d0719188da9915b90edf1ed6e",
+        "version" : "1.1.1"
+      }
+    }
+  ],
+  "version" : 3
+}

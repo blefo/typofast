@@ -9,9 +9,19 @@ import SwiftUI
 
 @main
 struct typofastApp: App {
+    @StateObject private var appState: AppState
+    @StateObject private var globalController: GlobalSuggestionController
+
+    init() {
+        let state = AppState()
+        _appState = StateObject(wrappedValue: state)
+        _globalController = StateObject(wrappedValue: GlobalSuggestionController(appState: state))
+    }
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        MenuBarExtra("Typofast", systemImage: "text.cursor") {
+            ContentView(appState: appState, globalController: globalController)
         }
+        .menuBarExtraStyle(.window)
     }
 }

@@ -13,12 +13,12 @@ struct CompletionMetrics {
 }
 
 private struct SamplingConfig {
-    var maxSuggestTokens: Int = 4
-    var temperature: Float = 0.6
+    var maxSuggestTokens: Int = 8
+    var temperature: Float = 0.15
     var topK: Int32 = 20
     var topP: Float = 0.9
     var minP: Float = 0.05
-    var repeatPenalty: Float = 1.0
+    var repeatPenalty: Float = 1.5
     var repeatLastN: Int32 = 0
     var frequencyPenalty: Float = 0.0
     var presencePenalty: Float = 0.0

@@ -7,11 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		583DFAA5DA478B29525144C7 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23EDF75E76063C8B86AE1346 /* Accelerate.framework */; };
 		5B7828A32F0EE1CE0081202D /* llama.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5B7828A12F0EE1BC0081202D /* llama.xcframework */; };
 		5B7828A42F0EE1CE0081202D /* llama.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 5B7828A12F0EE1BC0081202D /* llama.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		583DFAA5DA478B29525144C7 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23EDF75E76063C8B86AE1346 /* Accelerate.framework */; };
-		D8447DAAD48E22CB9743987B /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F7E0C8603A1EA2A5C06CBE99 /* Metal.framework */; };
 		8EDA45FE311638B29681484B /* MetalPerformanceShaders.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 055F8016B254ADF0847A0567 /* MetalPerformanceShaders.framework */; };
+		C0B1D2E3F4A5B6C7D8E9F003 /* CursorBounds in Frameworks */ = {isa = PBXBuildFile; productRef = C0B1D2E3F4A5B6C7D8E9F002 /* CursorBounds */; };
+		D8447DAAD48E22CB9743987B /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F7E0C8603A1EA2A5C06CBE99 /* Metal.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -46,13 +47,13 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		055F8016B254ADF0847A0567 /* MetalPerformanceShaders.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShaders.framework; path = System/Library/Frameworks/MetalPerformanceShaders.framework; sourceTree = SDKROOT; };
+		23EDF75E76063C8B86AE1346 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		5B7828762F0ED9EC0081202D /* typofast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = typofast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5B7828832F0ED9ED0081202D /* typofastTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = typofastTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		5B78288D2F0ED9ED0081202D /* typofastUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = typofastUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		5B7828A12F0EE1BC0081202D /* llama.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = llama.xcframework; sourceTree = "<group>"; };
-		23EDF75E76063C8B86AE1346 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		F7E0C8603A1EA2A5C06CBE99 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
-		055F8016B254ADF0847A0567 /* MetalPerformanceShaders.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShaders.framework; path = System/Library/Frameworks/MetalPerformanceShaders.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -82,6 +83,7 @@
 				D8447DAAD48E22CB9743987B /* Metal.framework in Frameworks */,
 				8EDA45FE311638B29681484B /* MetalPerformanceShaders.framework in Frameworks */,
 				5B7828A32F0EE1CE0081202D /* llama.xcframework in Frameworks */,
+				C0B1D2E3F4A5B6C7D8E9F003 /* CursorBounds in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -147,6 +149,7 @@
 			);
 			name = typofast;
 			packageProductDependencies = (
+				C0B1D2E3F4A5B6C7D8E9F002 /* CursorBounds */,
 			);
 			productName = typofast;
 			productReference = 5B7828762F0ED9EC0081202D /* typofast.app */;
@@ -230,6 +233,9 @@
 			);
 			mainGroup = 5B78286D2F0ED9EC0081202D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				C0B1D2E3F4A5B6C7D8E9F001 /* XCRemoteSwiftPackageReference "CursorBounds" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 5B7828772F0ED9EC0081202D /* Products */;
 			projectDirPath = "";
@@ -429,15 +435,16 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = typofast/typofast.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 9VTFDCD9H8;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -461,15 +468,16 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = typofast/typofast.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 9VTFDCD9H8;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -608,6 +616,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		C0B1D2E3F4A5B6C7D8E9F001 /* XCRemoteSwiftPackageReference "CursorBounds" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Aeastr/CursorBounds.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C0B1D2E3F4A5B6C7D8E9F002 /* CursorBounds */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0B1D2E3F4A5B6C7D8E9F001 /* XCRemoteSwiftPackageReference "CursorBounds" */;
+			productName = CursorBounds;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 5B78286E2F0ED9EC0081202D /* Project object */;
 }

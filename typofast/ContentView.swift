@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import Combine
-import UniformTypeIdentifiers
 
 @MainActor
 class AppState: ObservableObject {
@@ -13,10 +12,81 @@ class AppState: ObservableObject {
     @Published var suggestionBase = ""
     @Published var suggestionOffset = 0
     @Published var metrics: CompletionMetrics?
+    @Published var averageTtft: Double = 0
+    @Published var averageTokensPerSecond: Double = 0
+    @Published var metricsSamples: Int = 0
     @Published var modelPath: String?
+    @Published var disabledApps: [DisabledAppEntry] = []
 
     private var inferenceTask: Task<Void, Never>?
     private var lastText = ""
+    private var metricsObserver: NSObjectProtocol?
+    private var disabledAppsById: [String: String] = [:]
+    private let disabledAppsKey = "typofast.disabledApps"
+    private let defaultModelPath = "/Users/baptistelefort/Downloads/Qwen3-1.7B-Base.i1-Q4_K_M.gguf"
+
+    init() {
+        loadDisabledApps()
+        loadDefaultModelIfNeeded()
+        metricsObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("TypofastMetricsUpdate"),
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            guard let userInfo = notification.userInfo else { return }
+            var updated = CompletionMetrics()
+            if let ttft = userInfo["ttft"] as? Double {
+                updated.ttft = ttft
+            }
+            if let tps = userInfo["tokensPerSecond"] as? Double {
+                updated.tokensPerSecond = tps
+            }
+            if let tokens = userInfo["tokensGenerated"] as? Int {
+                updated.tokensGenerated = tokens
+            }
+            if let reused = userInfo["cachedTokensReused"] as? Int {
+                updated.cachedTokensReused = reused
+            }
+            self.applyMetrics(updated)
+        }
+    }
+
+    deinit {
+        if let observer = metricsObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+        }
+    }
+
+    func isAppDisabled(bundleId: String) -> Bool {
+        return disabledAppsById[bundleId] != nil
+    }
+
+    func setAppDisabled(bundleId: String, name: String?, disabled: Bool) {
+        if disabled {
+            disabledAppsById[bundleId] = name ?? bundleId
+        } else {
+            disabledAppsById.removeValue(forKey: bundleId)
+        }
+        persistDisabledApps()
+        publishDisabledApps()
+    }
+
+    func clearSuggestion() {
+        suggestion = ""
+        suggestionBase = ""
+        suggestionOffset = 0
+        metrics = nil
+    }
+
+    private func applyMetrics(_ updated: CompletionMetrics) {
+        metrics = updated
+        guard updated.ttft > 0 || updated.tokensPerSecond > 0 else { return }
+        metricsSamples += 1
+        let count = Double(metricsSamples)
+        averageTtft = ((averageTtft * (count - 1)) + updated.ttft) / count
+        averageTokensPerSecond = ((averageTokensPerSecond * (count - 1)) + updated.tokensPerSecond) / count
+    }
 
     func loadModel(path: String) async {
         isLoading = true
@@ -27,6 +97,7 @@ class AppState: ObservableObject {
             try await engine.loadModel(path: path)
             self.engine = engine
             self.modelPath = path
+            UserDefaults.standard.set(path, forKey: "typofast.modelPath")
             loadingStatus = "Model loaded successfully!"
 
             try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -80,7 +151,7 @@ class AppState: ObservableObject {
             lastText = ""
             return
         }
-        if !hasCompletedWord(newText) {
+        if !shouldTriggerCompletion(newText) {
             suggestion = ""
             suggestionBase = ""
             suggestionOffset = 0
@@ -118,39 +189,46 @@ class AppState: ObservableObject {
                 "raw": completion,
                 "sanitized": sanitized
             ])
-            metrics = completionMetrics
+            applyMetrics(completionMetrics)
         }
     }
 
     func acceptSuggestion() -> String {
-        guard !suggestion.isEmpty else { return "" }
+        let accepted = acceptedSuggestionText(firstWordOnly: true)
+        guard !accepted.isEmpty else { return "" }
 
-        // Accept first word only, no artificial spaces
-        let firstWord = firstWordWithLeadingWhitespace(from: suggestion)
-        currentText += firstWord
-        suggestion = ""
-        suggestionBase = ""
-        suggestionOffset = 0
-        metrics = nil
-
-        // Trigger new completion
-        onTextChange(currentText)
-        return firstWord
+        let newText = currentText + accepted
+        applyAcceptedSuggestion(accepted: accepted, newText: newText)
+        return accepted
     }
 
     func acceptAllSuggestion() -> String {
-        guard !suggestion.isEmpty else { return "" }
+        let accepted = acceptedSuggestionText(firstWordOnly: false)
+        guard !accepted.isEmpty else { return "" }
 
-        let accepted = suggestion
-        currentText += suggestion
+        let newText = currentText + accepted
+        applyAcceptedSuggestion(accepted: accepted, newText: newText)
+        return accepted
+    }
+
+    func acceptedSuggestionText(firstWordOnly: Bool) -> String {
+        guard !suggestion.isEmpty else { return "" }
+        if firstWordOnly {
+            return firstWordWithLeadingWhitespace(from: suggestion)
+        }
+        return suggestion
+    }
+
+    func applyAcceptedSuggestion(accepted: String, newText: String) {
+        guard !accepted.isEmpty else { return }
+
         suggestion = ""
         suggestionBase = ""
         suggestionOffset = 0
         metrics = nil
 
-        // Trigger new completion
-        onTextChange(currentText)
-        return accepted
+        currentText = newText
+        onTextChange(newText)
     }
 
     func regenerateAfterDeletingAcceptedSuggestion(newText: String) {
@@ -268,7 +346,8 @@ class AppState: ObservableObject {
         #endif
     }
 
-    private func hasCompletedWord(_ text: String) -> Bool {
+    private func shouldTriggerCompletion(_ text: String) -> Bool {
+        // V0 logic: only trigger after at least one completed word (word + whitespace)
         var inWord = false
         for ch in text {
             if ch.isWhitespace {
@@ -282,303 +361,151 @@ class AppState: ObservableObject {
 
     func clearAll() async {
         currentText = ""
-        suggestion = ""
-        metrics = nil
+        clearSuggestion()
         if let engine = engine {
             await engine.resetCache()
         }
     }
+
+    private func loadDisabledApps() {
+        if let data = UserDefaults.standard.data(forKey: disabledAppsKey),
+           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+            disabledAppsById = decoded
+        } else {
+            disabledAppsById = Self.defaultDisabledApps
+        }
+        publishDisabledApps()
+    }
+
+    private func loadDefaultModelIfNeeded() {
+        guard FileManager.default.fileExists(atPath: defaultModelPath) else {
+            loadingStatus = "Default model not found at \(defaultModelPath)"
+            return
+        }
+        Task {
+            await loadModel(path: defaultModelPath)
+        }
+    }
+
+    private func persistDisabledApps() {
+        if let data = try? JSONEncoder().encode(disabledAppsById) {
+            UserDefaults.standard.set(data, forKey: disabledAppsKey)
+        }
+    }
+
+    private func publishDisabledApps() {
+        disabledApps = disabledAppsById.map { DisabledAppEntry(id: $0.key, name: $0.value) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var modelDisplayName: String {
+        URL(fileURLWithPath: modelPath ?? defaultModelPath).lastPathComponent
+    }
+
+    private static let defaultDisabledApps: [String: String] = [
+        "com.apple.Terminal": "Terminal",
+        "com.apple.dt.Xcode": "Xcode",
+        "com.googlecode.iterm2": "iTerm2",
+        "dev.warp.Warp-Stable": "Warp",
+        "com.microsoft.VSCode": "Visual Studio Code"
+    ]
+}
+
+struct DisabledAppEntry: Identifiable, Hashable {
+    let id: String
+    let name: String
 }
 
 struct ContentView: View {
-    @StateObject private var appState = AppState()
+    @ObservedObject var appState: AppState
+    @ObservedObject var globalController: GlobalSuggestionController
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Top toolbar
-            HStack {
-                Button(action: selectModel) {
-                    Label(
-                        appState.modelPath == nil ? "Select Model" : "Change Model",
-                        systemImage: "folder"
-                    )
-                }
-
-                if let modelPath = appState.modelPath {
-                    Text(URL(fileURLWithPath: modelPath).lastPathComponent)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-
-                Spacer()
-
-                Button(action: {
-                    Task {
-                        await appState.clearAll()
-                    }
-                }) {
-                    Label("Clear Cache", systemImage: "trash")
-                }
-                .disabled(appState.engine == nil)
-            }
-            .padding()
-            .background(Color(NSColor.windowBackgroundColor))
-
-            Divider()
-
-            // Main editor area
-            if appState.isLoading {
-                VStack {
-                    ProgressView()
-                        .scaleEffect(1.5)
-                    Text(appState.loadingStatus)
-                        .font(.headline)
-                        .padding()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if appState.engine == nil {
-                VStack {
-                    Image(systemName: "doc.text")
-                        .font(.system(size: 60))
-                        .foregroundColor(.secondary)
-                    Text("Select a GGUF model to start")
-                        .font(.headline)
-                        .padding()
-                    Button("Select Model") {
-                        selectModel()
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                TextEditorWithSuggestions(
-                    text: $appState.currentText,
-                    suggestion: appState.suggestion,
-                    onTextChange: { appState.onTextChange($0) },
-                    onAcceptSuggestion: { appState.acceptSuggestion() },
-                    onAcceptAllSuggestion: { appState.acceptAllSuggestion() },
-                    onDeleteAcceptedSuggestion: { appState.regenerateAfterDeletingAcceptedSuggestion(newText: $0) }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 10) {
+            sectionView(title: "Model", systemImage: "brain") {
+                Text(appState.modelDisplayName)
+                    .font(.system(.body, design: .rounded))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            // Metrics footer
-            if let metrics = appState.metrics {
-                Divider()
-                HStack {
-                    Text("TTFT: \(String(format: "%.0f", metrics.ttft * 1000))ms")
-                    Text("•")
-                    Text("\(String(format: "%.1f", metrics.tokensPerSecond)) tok/s")
-                    Text("•")
-                    Text("Cache: \(metrics.cachedTokensReused)")
-                    Spacer()
-                }
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .padding(.horizontal)
-                .padding(.vertical, 8)
-                .background(Color(NSColor.windowBackgroundColor))
+            sectionView(title: "Statistics", systemImage: "speedometer") {
+                statsContent()
+            }
+
+            sectionView(title: "Permissions", systemImage: "checkmark.seal") {
+                Text(permissionsStatusText())
+                    .font(.system(.body, design: .rounded))
+                    .foregroundColor(permissionsOk() ? .secondary : .primary)
             }
         }
-        .frame(minWidth: 600, minHeight: 400)
+        .padding(14)
+        .frame(width: 360, height: 220)
+        .onAppear {
+            globalController.start()
+        }
     }
 
-    private func selectModel() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowedContentTypes = [.item]
-        panel.allowsOtherFileTypes = true
-        panel.message = "Select a GGUF model file"
+    private func permissionsOk() -> Bool {
+        globalController.accessibilityEnabled
+            && globalController.inputMonitoringEnabled
+            && globalController.screenRecordingEnabled
+    }
 
-        if panel.runModal() == .OK, let url = panel.url {
-            Task {
-                await appState.loadModel(path: url.path)
+    private func permissionsStatusText() -> String {
+        if permissionsOk() {
+            return "OK"
+        }
+        var missing: [String] = []
+        if !globalController.accessibilityEnabled {
+            missing.append("Accessibility")
+        }
+        if !globalController.inputMonitoringEnabled {
+            missing.append("Input Monitoring")
+        }
+        if !globalController.screenRecordingEnabled {
+            missing.append("Screen Recording")
+        }
+        return "Missing: " + missing.joined(separator: ", ")
+    }
+
+    private func statsContent() -> Text {
+        if let metrics = appState.metrics {
+            return Text("TTFT \(String(format: "%.0f", metrics.ttft * 1000)) ms  •  \(String(format: "%.1f", metrics.tokensPerSecond)) tok/s  •  Cache \(metrics.cachedTokensReused)")
+                .font(.system(.body, design: .rounded))
+        }
+        return Text(appState.isLoading ? "Loading…" : "No stats yet")
+            .font(.system(.body, design: .rounded))
+            .foregroundColor(.secondary)
+    }
+
+    private func sectionView<Content: View>(
+        title: String,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text(title)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
+            content()
         }
-    }
-}
-
-struct TextEditorWithSuggestions: NSViewRepresentable {
-    @Binding var text: String
-    let suggestion: String
-    let onTextChange: (String) -> Void
-    let onAcceptSuggestion: () -> String
-    let onAcceptAllSuggestion: () -> String
-    let onDeleteAcceptedSuggestion: (String) -> Void
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        let textView = scrollView.documentView as! NSTextView
-
-        textView.isRichText = false
-        textView.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
-        textView.textColor = .labelColor
-        textView.backgroundColor = .textBackgroundColor
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        textView.delegate = context.coordinator
-
-        context.coordinator.textView = textView
-        context.coordinator.scrollView = scrollView
-
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
-
-        // Update text if different
-        if textView.string != text {
-            textView.string = text
-        }
-
-        // Update suggestion display
-        context.coordinator.updateSuggestion(suggestion)
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(
-            text: $text,
-            onTextChange: onTextChange,
-            onAcceptSuggestion: onAcceptSuggestion,
-            onAcceptAllSuggestion: onAcceptAllSuggestion,
-            onDeleteAcceptedSuggestion: onDeleteAcceptedSuggestion
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(NSColor.controlBackgroundColor))
         )
-    }
-
-    class Coordinator: NSObject, NSTextViewDelegate {
-        @Binding var text: String
-        let onTextChange: (String) -> Void
-        let onAcceptSuggestion: () -> String
-        let onAcceptAllSuggestion: () -> String
-        let onDeleteAcceptedSuggestion: (String) -> Void
-
-        weak var textView: NSTextView?
-        weak var scrollView: NSScrollView?
-        private var suggestionLayer: CATextLayer?
-        private var lastAcceptedRange: NSRange?
-        private var lastAcceptedText = ""
-
-        init(
-            text: Binding<String>,
-            onTextChange: @escaping (String) -> Void,
-            onAcceptSuggestion: @escaping () -> String,
-            onAcceptAllSuggestion: @escaping () -> String,
-            onDeleteAcceptedSuggestion: @escaping (String) -> Void
-        ) {
-            self._text = text
-            self.onTextChange = onTextChange
-            self.onAcceptSuggestion = onAcceptSuggestion
-            self.onAcceptAllSuggestion = onAcceptAllSuggestion
-            self.onDeleteAcceptedSuggestion = onDeleteAcceptedSuggestion
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
-            text = textView.string
-            onTextChange(textView.string)
-        }
-
-        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
-            if replacementString == "@" {
-                let accepted = acceptAllSuggestion(from: textView)
-                return accepted.isEmpty
-            }
-
-            if let replacementString = replacementString, !replacementString.isEmpty {
-                lastAcceptedRange = nil
-                lastAcceptedText = ""
-            }
-            return true
-        }
-
-        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            // Handle Tab to accept suggestion
-            if commandSelector == #selector(NSResponder.insertTab(_:)) {
-                _ = acceptSuggestion(from: textView)
-                return true
-            }
-
-            if commandSelector == #selector(NSResponder.deleteBackward(_:)) {
-                if let range = lastAcceptedRange,
-                   textView.selectedRange().location == range.location + range.length {
-                    textView.textStorage?.deleteCharacters(in: range)
-                    text = textView.string
-                    onDeleteAcceptedSuggestion(textView.string)
-                    lastAcceptedRange = nil
-                    lastAcceptedText = ""
-                    return true
-                }
-            }
-
-            return false
-        }
-
-        func updateSuggestion(_ suggestion: String) {
-            guard let textView = textView else { return }
-
-            // Remove old suggestion layer
-            suggestionLayer?.removeFromSuperlayer()
-            suggestionLayer = nil
-
-            guard !suggestion.isEmpty else { return }
-
-            // Calculate position after cursor
-            let cursorRect = textView.layoutManager?.boundingRect(
-                forGlyphRange: NSRange(location: textView.selectedRange().location, length: 0),
-                in: textView.textContainer!
-            ) ?? .zero
-
-            // Create suggestion layer
-            let layer = CATextLayer()
-            layer.string = suggestion
-            layer.font = textView.font
-            layer.fontSize = textView.font?.pointSize ?? 14
-            layer.foregroundColor = NSColor.systemGray.cgColor
-            layer.contentsScale = textView.window?.backingScaleFactor ?? 2.0
-
-            let size = (suggestion as NSString).size(withAttributes: [
-                .font: textView.font ?? NSFont.systemFont(ofSize: 14)
-            ])
-
-            layer.frame = CGRect(
-                x: cursorRect.maxX + textView.textContainerInset.width,
-                y: cursorRect.minY + textView.textContainerInset.height,
-                width: size.width,
-                height: size.height
-            )
-
-            textView.layer?.addSublayer(layer)
-            suggestionLayer = layer
-        }
-
-        private func acceptSuggestion(from textView: NSTextView) -> String {
-            let before = textView.selectedRange().location
-            let accepted = onAcceptSuggestion()
-            if !accepted.isEmpty {
-                lastAcceptedRange = NSRange(location: before, length: accepted.count)
-                lastAcceptedText = accepted
-            }
-            return accepted
-        }
-
-        private func acceptAllSuggestion(from textView: NSTextView) -> String {
-            let before = textView.selectedRange().location
-            let accepted = onAcceptAllSuggestion()
-            if !accepted.isEmpty {
-                lastAcceptedRange = NSRange(location: before, length: accepted.count)
-                lastAcceptedText = accepted
-            }
-            return accepted
-        }
     }
 }
 
 #Preview {
-    ContentView()
+    let state = AppState()
+    ContentView(appState: state, globalController: GlobalSuggestionController(appState: state))
         .frame(width: 800, height: 600)
 }
