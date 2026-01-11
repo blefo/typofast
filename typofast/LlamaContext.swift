@@ -15,6 +15,7 @@ final class LlamaContext {
     private var context: OpaquePointer?
     private var vocab: OpaquePointer?
     private var temporaryInvalidBytes: [CChar] = []
+    private var contextParams: llama_context_params?
 
     private(set) var nVocab: Int32 = 0
 
@@ -80,6 +81,7 @@ final class LlamaContext {
             throw LlamaError.contextInitFailed
         }
         self.context = context
+        self.contextParams = ctxParams
 
         if let info = llama_print_system_info() {
             print(String(cString: info))
@@ -209,6 +211,20 @@ final class LlamaContext {
         guard let context = context else { return false }
         let memory = llama_get_memory(context)
         return llama_memory_seq_rm(memory, seqId, from, -1)
+    }
+
+    func resetContext() -> Bool {
+        guard let model = model, let params = contextParams else { return false }
+        if let context = context {
+            llama_free(context)
+            self.context = nil
+        }
+        guard let newContext = llama_new_context_with_model(model, params) else {
+            return false
+        }
+        self.context = newContext
+        temporaryInvalidBytes.removeAll()
+        return true
     }
 
     func copySequence(from src: Int32, to dst: Int32) {

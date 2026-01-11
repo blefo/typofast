@@ -2,6 +2,12 @@ import SwiftUI
 import AppKit
 import Combine
 
+enum TextChangeSource {
+    case key
+    case ax
+    case `internal`
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var engine: AutocompleteEngine?
@@ -14,16 +20,26 @@ class AppState: ObservableObject {
     @Published var metrics: CompletionMetrics?
     @Published var averageTtft: Double = 0
     @Published var averageTokensPerSecond: Double = 0
+    @Published var averageCachedTokensReused: Double = 0
     @Published var metricsSamples: Int = 0
     @Published var modelPath: String?
     @Published var disabledApps: [DisabledAppEntry] = []
+    @Published var isGenerating = false
 
     private var inferenceTask: Task<Void, Never>?
+    private var debounceTask: Task<Void, Never>?
     private var lastText = ""
+    private var lastRequestedInput = ""
+    private var lastAppliedSuggestion = ""
+    private var lastEmptyCompletionInput: String?
+    private var inFlightRequestId: UUID?
+    private var suggestionAnchor = ""
+    private var suppressNextInference = false
     private var metricsObserver: NSObjectProtocol?
     private var disabledAppsById: [String: String] = [:]
     private let disabledAppsKey = "typofast.disabledApps"
     private let defaultModelPath = "/Users/baptistelefort/Downloads/Qwen3-1.7B-Base.i1-Q4_K_M.gguf"
+    private let debounceDelayNs: UInt64 = 0_000_000
 
     init() {
         loadDisabledApps()
@@ -76,16 +92,23 @@ class AppState: ObservableObject {
         suggestion = ""
         suggestionBase = ""
         suggestionOffset = 0
+        suggestionAnchor = ""
+        isGenerating = false
+        lastRequestedInput = ""
+        lastAppliedSuggestion = ""
+        lastEmptyCompletionInput = nil
+        inFlightRequestId = nil
         metrics = nil
     }
 
     private func applyMetrics(_ updated: CompletionMetrics) {
         metrics = updated
-        guard updated.ttft > 0 || updated.tokensPerSecond > 0 else { return }
+        guard updated.ttft > 0 || updated.tokensPerSecond > 0 || updated.cachedTokensReused > 0 else { return }
         metricsSamples += 1
         let count = Double(metricsSamples)
         averageTtft = ((averageTtft * (count - 1)) + updated.ttft) / count
         averageTokensPerSecond = ((averageTokensPerSecond * (count - 1)) + updated.tokensPerSecond) / count
+        averageCachedTokensReused = ((averageCachedTokensReused * (count - 1)) + Double(updated.cachedTokensReused)) / count
     }
 
     func loadModel(path: String) async {
@@ -109,7 +132,10 @@ class AppState: ObservableObject {
         }
     }
 
-    func onTextChange(_ newText: String) {
+    func onTextChange(_ newText: String, source: TextChangeSource = .ax) {
+        if newText == lastText {
+            return
+        }
         let previousText = lastText
         logEvent("textChange", [
             "prev": previousText,
@@ -118,76 +144,172 @@ class AppState: ObservableObject {
             "base": suggestionBase,
             "offset": "\(suggestionOffset)"
         ])
-        if shouldKeepSuggestionOnTrailingWhitespace(previousText: previousText, newText: newText) {
+        if lastEmptyCompletionInput != nil, lastEmptyCompletionInput != newText {
+            lastEmptyCompletionInput = nil
+        }
+        let changeStart = CFAbsoluteTimeGetCurrent()
+        if !suggestionBase.isEmpty,
+           !suggestionAnchor.isEmpty,
+           !newText.hasPrefix(suggestionAnchor),
+           !suggestionAnchor.hasPrefix(newText) {
             inferenceTask?.cancel()
+            suggestion = ""
+            suggestionBase = ""
+            suggestionOffset = 0
+            suggestionAnchor = ""
+            isGenerating = false
+            lastRequestedInput = ""
+            lastAppliedSuggestion = ""
+            lastEmptyCompletionInput = nil
+            inFlightRequestId = nil
             currentText = newText
             lastText = newText
-            logEvent("keepSuggestion.trailingWhitespace", [
-                "typed": String(newText.dropFirst(previousText.count))
-            ])
             return
         }
-        if shouldKeepSuggestionAlive(previousText: previousText, newText: newText) {
-            inferenceTask?.cancel()
+        if suppressNextInference {
+            suppressNextInference = false
+            isGenerating = false
+            lastRequestedInput = ""
+            lastAppliedSuggestion = ""
+            lastEmptyCompletionInput = nil
+            inFlightRequestId = nil
+            currentText = newText
             lastText = newText
-            logEvent("keepSuggestion.matching", [
-                "typed": String(newText.dropFirst(previousText.count)),
-                "remaining": String(suggestionBase.dropFirst(suggestionOffset))
-            ])
+            return
+        }
+        if updateSuggestionForTextChange(newText: newText) {
+            inferenceTask?.cancel()
+            isGenerating = false
+            lastText = newText
             return
         }
 
         currentText = newText
         lastText = newText
-
         inferenceTask?.cancel()
+        debounceTask?.cancel()
+        inFlightRequestId = nil
+        if newText == lastRequestedInput {
+            return
+        }
+        isGenerating = false
 
         // Clear suggestion immediately if text is empty
         if newText.isEmpty {
             suggestion = ""
             suggestionBase = ""
             suggestionOffset = 0
+            suggestionAnchor = ""
             metrics = nil
+            isGenerating = false
+            lastRequestedInput = ""
+            lastAppliedSuggestion = ""
+            lastEmptyCompletionInput = nil
+            inFlightRequestId = nil
             lastText = ""
+            return
+        }
+        if hasValidSuggestion(for: newText) {
+            isGenerating = false
+            return
+        }
+        if lastEmptyCompletionInput == newText {
+            isGenerating = false
             return
         }
         if !shouldTriggerCompletion(newText) {
             suggestion = ""
             suggestionBase = ""
             suggestionOffset = 0
+            suggestionAnchor = ""
             metrics = nil
+            isGenerating = false
+            lastRequestedInput = ""
+            lastAppliedSuggestion = ""
+            lastEmptyCompletionInput = nil
+            inFlightRequestId = nil
             return
         }
 
-        inferenceTask = Task { @MainActor in
+        debounceTask = Task { @MainActor in
             guard !Task.isCancelled else { return }
-            await requestCompletion(newText)
+            try? await Task.sleep(nanoseconds: debounceDelayNs)
+            guard !Task.isCancelled else { return }
+            guard currentText == newText else { return }
+            if newText == lastRequestedInput { return }
+            if hasValidSuggestion(for: newText) { return }
+            if lastEmptyCompletionInput == newText { return }
+            isGenerating = true
+            lastRequestedInput = newText
+            let requestStart = CFAbsoluteTimeGetCurrent()
+            inferenceTask?.cancel()
+            inferenceTask = Task { @MainActor in
+                let requestId = UUID()
+                inFlightRequestId = requestId
+                await requestCompletion(newText, requestId: requestId)
+            }
+            await inferenceTask?.value
+            let requestEnd = CFAbsoluteTimeGetCurrent()
+            isGenerating = false
+            logEvent("timing.requestCompletion", [
+                "durationMs": String(format: "%.2f", (requestEnd - requestStart) * 1000.0),
+                "textLength": "\(newText.count)"
+            ])
         }
+
+        let changeEnd = CFAbsoluteTimeGetCurrent()
+        logEvent("timing.onTextChange", [
+            "durationMs": String(format: "%.2f", (changeEnd - changeStart) * 1000.0),
+            "textLength": "\(newText.count)"
+        ])
     }
 
-    private func requestCompletion(_ text: String) async {
+    private func requestCompletion(_ text: String, requestId: UUID) async {
         guard let engine = engine else { return }
 
-        let modelPrompt = trimTrailingSpaces(text)
+        let systemPrompt = """
+        User context: My name is Baptiste Lefort. I usually write in English and French.
+        Write causually with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
+        """
+        let trimmedText = trimTrailingSpaces(text)
+        let modelPrompt = "\(systemPrompt)\n\(trimmedText)"
         logEvent("requestCompletion", [
             "text": text,
             "modelPrompt": modelPrompt
         ])
+        let generationStart = CFAbsoluteTimeGetCurrent()
         let (completion, completionMetrics) = await engine.getCompletion(
             prompt: modelPrompt,
             inputText: text,
             maxTokens: 6
         )
+        guard inFlightRequestId == requestId else { return }
+        let generationEnd = CFAbsoluteTimeGetCurrent()
+        logEvent("timing.engineCompletion", [
+            "durationMs": String(format: "%.2f", (generationEnd - generationStart) * 1000.0),
+            "tokens": "\(completionMetrics.tokensGenerated)",
+            "tps": String(format: "%.2f", completionMetrics.tokensPerSecond),
+            "ttft": String(format: "%.2f", completionMetrics.ttft * 1000.0)
+        ])
 
         // Only update if text hasn't changed
         if text == currentText {
-            let sanitized = sanitizeSuggestion(completion, forPrompt: text)
-            suggestionBase = sanitized
+            lastAppliedSuggestion = completion
+            if completion.isEmpty {
+                lastEmptyCompletionInput = text
+            } else {
+                lastEmptyCompletionInput = nil
+            }
+            suggestionBase = completion
             suggestionOffset = 0
-            suggestion = sanitized
+            suggestion = completion
+            suggestionAnchor = text
             logEvent("completionReceived", [
                 "raw": completion,
-                "sanitized": sanitized
+                "sanitized": completion
+            ])
+            logEvent("timing.suggestionApplied", [
+                "suggestionLength": "\(completion.count)"
             ])
             applyMetrics(completionMetrics)
         }
@@ -198,7 +320,7 @@ class AppState: ObservableObject {
         guard !accepted.isEmpty else { return "" }
 
         let newText = currentText + accepted
-        applyAcceptedSuggestion(accepted: accepted, newText: newText)
+        applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: true)
         return accepted
     }
 
@@ -207,7 +329,7 @@ class AppState: ObservableObject {
         guard !accepted.isEmpty else { return "" }
 
         let newText = currentText + accepted
-        applyAcceptedSuggestion(accepted: accepted, newText: newText)
+        applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: false)
         return accepted
     }
 
@@ -219,35 +341,42 @@ class AppState: ObservableObject {
         return suggestion
     }
 
-    func applyAcceptedSuggestion(accepted: String, newText: String) {
+    func applyAcceptedSuggestion(accepted: String, newText: String, keepRemaining: Bool) {
         guard !accepted.isEmpty else { return }
 
-        suggestion = ""
-        suggestionBase = ""
-        suggestionOffset = 0
-        metrics = nil
+        if keepRemaining, !suggestionBase.isEmpty {
+            suggestionOffset += accepted.count
+            if suggestionOffset < suggestionBase.count {
+                suggestion = String(suggestionBase.dropFirst(suggestionOffset))
+                suggestionAnchor = newText
+            } else {
+                suggestion = ""
+                suggestionBase = ""
+                suggestionOffset = 0
+                suggestionAnchor = ""
+                metrics = nil
+            }
+        } else {
+            suggestion = ""
+            suggestionBase = ""
+            suggestionOffset = 0
+            suggestionAnchor = ""
+            metrics = nil
+        }
 
+        suppressNextInference = true
         currentText = newText
-        onTextChange(newText)
+        lastText = newText
     }
 
     func regenerateAfterDeletingAcceptedSuggestion(newText: String) {
         suggestion = ""
         suggestionBase = ""
         suggestionOffset = 0
+        suggestionAnchor = ""
         metrics = nil
         lastText = ""
-        onTextChange(newText)
-    }
-
-    private func sanitizeSuggestion(_ suggestion: String, forPrompt prompt: String) -> String {
-        guard !suggestion.isEmpty else { return "" }
-
-        if promptEndsWithSpaceOrTab(prompt) {
-            return trimLeadingWhitespace(suggestion)
-        }
-
-        return suggestion
+        onTextChange(newText, source: .internal)
     }
 
     private func trimTrailingSpaces(_ text: String) -> String {
@@ -262,24 +391,6 @@ class AppState: ObservableObject {
             }
         }
         return String(text[..<end])
-    }
-
-    private func promptEndsWithSpaceOrTab(_ text: String) -> Bool {
-        guard let lastChar = text.last else { return false }
-        return lastChar == " " || lastChar == "\t"
-    }
-
-    private func trimLeadingWhitespace(_ text: String) -> String {
-        var start = text.startIndex
-        while start < text.endIndex {
-            let ch = text[start]
-            if ch == " " || ch == "\t" {
-                start = text.index(after: start)
-            } else {
-                break
-            }
-        }
-        return String(text[start...])
     }
 
     private func firstWordWithLeadingWhitespace(from suggestion: String) -> String {
@@ -301,42 +412,44 @@ class AppState: ObservableObject {
         return String(suggestion[..<end])
     }
 
-    private func shouldKeepSuggestionAlive(previousText: String, newText: String) -> Bool {
+    private func updateSuggestionForTextChange(newText: String) -> Bool {
         guard !suggestionBase.isEmpty else { return false }
-        guard newText.count >= previousText.count else { return false }
-        guard newText.hasPrefix(previousText) else { return false }
-
-        let typedStart = newText.index(newText.startIndex, offsetBy: previousText.count)
-        let typed = String(newText[typedStart...])
-        if typed.isEmpty { return false }
-
-        let remaining = String(suggestionBase.dropFirst(suggestionOffset))
-        if remaining.hasPrefix(typed) {
-            suggestionOffset += typed.count
-            suggestion = String(suggestionBase.dropFirst(suggestionOffset))
-            currentText = newText
-            return true
+        guard !suggestionAnchor.isEmpty else { return false }
+        guard newText.hasPrefix(suggestionAnchor) else {
+            suggestion = ""
+            suggestionBase = ""
+            suggestionOffset = 0
+            suggestionAnchor = ""
+            metrics = nil
+            return false
         }
 
-        return false
+        let consumed = String(newText.dropFirst(suggestionAnchor.count))
+        guard suggestionBase.hasPrefix(consumed) else {
+            suggestion = ""
+            suggestionBase = ""
+            suggestionOffset = 0
+            suggestionAnchor = ""
+            metrics = nil
+            return false
+        }
+
+        suggestionOffset = consumed.count
+        suggestion = String(suggestionBase.dropFirst(suggestionOffset))
+        currentText = newText
+        logEvent("keepSuggestion.matching", [
+            "typed": consumed,
+            "remaining": suggestion
+        ])
+        return true
     }
 
-    private func shouldKeepSuggestionOnTrailingWhitespace(previousText: String, newText: String) -> Bool {
+    private func hasValidSuggestion(for newText: String) -> Bool {
         guard !suggestionBase.isEmpty else { return false }
-        guard newText.count > previousText.count else { return false }
-        guard newText.hasPrefix(previousText) else { return false }
-
-        let typedStart = newText.index(newText.startIndex, offsetBy: previousText.count)
-        let typed = newText[typedStart...]
-        if typed.isEmpty { return false }
-        guard typed.allSatisfy({ $0 == " " || $0 == "\t" }) else { return false }
-
-        let remaining = String(suggestionBase.dropFirst(suggestionOffset))
-        if remaining.hasPrefix(typed) {
-            suggestionOffset += typed.count
-            suggestion = String(suggestionBase.dropFirst(suggestionOffset))
-        }
-        return true
+        guard !suggestionAnchor.isEmpty else { return false }
+        guard newText.hasPrefix(suggestionAnchor) else { return false }
+        let consumed = String(newText.dropFirst(suggestionAnchor.count))
+        return suggestionBase.hasPrefix(consumed)
     }
 
     private func logEvent(_ name: String, _ data: [String: String]) {
@@ -470,8 +583,8 @@ struct ContentView: View {
     }
 
     private func statsContent() -> Text {
-        if let metrics = appState.metrics {
-            return Text("TTFT \(String(format: "%.0f", metrics.ttft * 1000)) ms  •  \(String(format: "%.1f", metrics.tokensPerSecond)) tok/s  •  Cache \(metrics.cachedTokensReused)")
+        if appState.metricsSamples > 0 {
+            return Text("Avg TTFT \(String(format: "%.0f", appState.averageTtft * 1000)) ms  •  Avg \(String(format: "%.1f", appState.averageTokensPerSecond)) tok/s  •  Avg Cache \(String(format: "%.1f", appState.averageCachedTokensReused))")
                 .font(.system(.body, design: .rounded))
         }
         return Text(appState.isLoading ? "Loading…" : "No stats yet")

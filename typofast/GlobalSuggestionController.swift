@@ -34,8 +34,14 @@ final class GlobalSuggestionController: ObservableObject {
     private var keyBuffer: String = ""
     private var lastCursorPoint: CGPoint?
     private var lastCursorUpdateTime: CFAbsoluteTime = 0
-    private var overlayRetryTimer: DispatchSourceTimer?
-    private var overlayRetryDeadline: CFAbsoluteTime = 0
+    private var lastAXRefreshTime: CFAbsoluteTime = 0
+    private var lastKeyRefreshTime: CFAbsoluteTime = 0
+    private var lastTimerRefreshTime: CFAbsoluteTime = 0
+    private var lastKeyBufferUpdateTime: CFAbsoluteTime = 0
+    private var axRefreshScheduled = false
+    private var lastOverlayText: String = ""
+    private var lastOverlayCaret: CGPoint?
+    private var lastOverlayFontKey: String = ""
     private var cancellables = Set<AnyCancellable>()
 
     init(appState: AppState) {
@@ -46,10 +52,9 @@ final class GlobalSuggestionController: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 if self.appState.suggestion.isEmpty {
-                    self.stopOverlayRetry()
                     self.updateOverlay()
                 } else {
-                    self.refreshOverlaySoon(reason: "suggestionChanged")
+                    self.updateOverlay()
                 }
             }
             .store(in: &cancellables)
@@ -138,6 +143,30 @@ final class GlobalSuggestionController: ObservableObject {
 
     @MainActor
     private func refreshFocusedText(trigger: RefreshTrigger) {
+        if trigger == .timer,
+           appState.suggestion.isEmpty,
+           !appState.isGenerating {
+            return
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        if trigger == .ax {
+            if now - lastAXRefreshTime < 0.05, !appState.isGenerating {
+                return
+            }
+            lastAXRefreshTime = now
+        } else if trigger == .key {
+            if now - lastKeyRefreshTime < 0.02, !appState.isGenerating {
+                return
+            }
+            lastKeyRefreshTime = now
+        } else if trigger == .timer {
+            let interval: CFAbsoluteTime = (appState.isGenerating || !appState.suggestion.isEmpty) ? 0.2 : 0.6
+            if now - lastTimerRefreshTime < interval {
+                return
+            }
+            lastTimerRefreshTime = now
+        }
+        let refreshStart = CFAbsoluteTimeGetCurrent()
         accessibilityEnabled = CursorBounds.isAccessibilityEnabled()
         screenRecordingEnabled = Self.hasScreenRecordingPermission()
 
@@ -184,6 +213,10 @@ final class GlobalSuggestionController: ObservableObject {
 
         let context = fetchFocusedTextContextSync()
         applyFocusedContext(context, trigger: trigger)
+        let refreshEnd = CFAbsoluteTimeGetCurrent()
+        #if DEBUG
+        print("[Typofast] timing.refreshFocusedText trigger=\(trigger) durationMs=\(String(format: "%.2f", (refreshEnd - refreshStart) * 1000.0))")
+        #endif
     }
 
     private func updateAXObserver(for pid: pid_t) {
@@ -239,7 +272,14 @@ final class GlobalSuggestionController: ObservableObject {
                 || notification == kAXFocusedWindowChangedNotification as String {
                 self.registerElementNotificationsIfNeeded()
             }
-            self.refreshFocusedText(trigger: .ax)
+            if !self.axRefreshScheduled {
+                self.axRefreshScheduled = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.axRefreshScheduled = false
+                    self.refreshFocusedText(trigger: .ax)
+                }
+            }
         }
     }
 
@@ -262,14 +302,52 @@ final class GlobalSuggestionController: ObservableObject {
         guard let context else {
             focusedContext = nil
             if !appState.suggestion.isEmpty {
-                refreshOverlaySoon(reason: "contextMissing")
+                updateOverlay()
             }
             return
         }
 
         focusedContext = context
 
-        if let value = context.value, let suppressed = suppressNextTextChange, suppressed == value {
+        let normalizedValue = context.value.map { normalizeObservedValue($0) }
+        if trigger == .ax,
+           let value = normalizedValue {
+            let now = CFAbsoluteTimeGetCurrent()
+            let current = appState.currentText
+            if now - lastKeyBufferUpdateTime < 0.4,
+               !keyBuffer.isEmpty,
+               !value.hasPrefix(keyBuffer),
+               !keyBuffer.hasPrefix(value) {
+                return
+            }
+            if now - lastKeyRefreshTime < 0.25,
+               !current.isEmpty,
+               !value.hasPrefix(current),
+               !current.hasPrefix(value) {
+                return
+            }
+            if !current.isEmpty,
+               !value.hasPrefix(current),
+               !current.hasPrefix(value),
+               current.hasSuffix(value),
+               current.count - value.count <= 3 {
+                return
+            }
+        }
+        if trigger == .ax,
+           let value = normalizedValue {
+            let current = appState.currentText
+            if !current.isEmpty,
+               !value.hasPrefix(current),
+               !current.hasPrefix(value),
+               current.hasSuffix(value),
+               current.count - value.count <= 3 {
+                return
+            }
+        }
+        if let value = normalizedValue,
+           let suppressed = suppressNextTextChange,
+           normalizeObservedValue(suppressed) == value {
             suppressNextTextChange = nil
             lastObservedText = value
             if let range = context.selectedRange {
@@ -280,7 +358,7 @@ final class GlobalSuggestionController: ObservableObject {
         }
 
         let textChanged: Bool
-        if let value = context.value {
+        if let value = normalizedValue {
             textChanged = value != lastObservedText
         } else {
             textChanged = false
@@ -305,7 +383,7 @@ final class GlobalSuggestionController: ObservableObject {
         }
 
         if textChanged || rangeChanged {
-            if let value = context.value {
+            if let value = normalizedValue {
                 lastObservedText = value
             }
             if let range = context.selectedRange {
@@ -313,38 +391,43 @@ final class GlobalSuggestionController: ObservableObject {
             }
             lastAcceptedRange = nil
             lastAcceptedText = ""
-            if let value = context.value {
-                appState.onTextChange(value)
+            if let value = normalizedValue {
+                appState.onTextChange(value, source: .ax)
             }
             if appState.suggestion.isEmpty {
                 updateOverlay()
             } else {
-                refreshOverlaySoon(reason: "textChange")
+                updateOverlay()
             }
         }
     }
 
-    private func updateOverlay() {
-        tryUpdateOverlay(reason: "updateOverlay")
-    }
-
-    private func refreshOverlaySoon(reason: String) {
-        overlayRetryDeadline = CFAbsoluteTimeGetCurrent() + 0.5
-        overlayRetryTimer?.cancel()
-        overlayRetryTimer = nil
-
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(16))
-        timer.setEventHandler { [weak self] in
-            self?.tryUpdateOverlay(reason: reason)
+    private func normalizeObservedValue(_ value: String) -> String {
+        if value.hasSuffix("\r\n") {
+            let trimmed = value.dropLast(2)
+            if !trimmed.contains("\n") && !trimmed.contains("\r") {
+                return String(trimmed)
+            }
         }
-        overlayRetryTimer = timer
-        timer.resume()
+        if value.hasSuffix("\n") || value.hasSuffix("\r") {
+            let trimmed = value.dropLast()
+            if !trimmed.contains("\n") && !trimmed.contains("\r") {
+                return String(trimmed)
+            }
+        }
+        return value
     }
 
-    private func stopOverlayRetry() {
-        overlayRetryTimer?.cancel()
-        overlayRetryTimer = nil
+    private func updateOverlay() {
+        if appState.suggestion.isEmpty && overlayMode == .hidden {
+            return
+        }
+        let overlayStart = CFAbsoluteTimeGetCurrent()
+        tryUpdateOverlay(reason: "updateOverlay")
+        let overlayEnd = CFAbsoluteTimeGetCurrent()
+        #if DEBUG
+        print("[Typofast] timing.updateOverlay durationMs=\(String(format: "%.2f", (overlayEnd - overlayStart) * 1000.0))")
+        #endif
     }
 
     private func cursorPointWithGrace() -> CGPoint? {
@@ -359,7 +442,12 @@ final class GlobalSuggestionController: ObservableObject {
     }
 
     private func readCaretPoint() -> CGPoint? {
+        let caretStart = CFAbsoluteTimeGetCurrent()
         if let caretRect = focusedContext?.caretRect {
+            #if DEBUG
+            let caretEnd = CFAbsoluteTimeGetCurrent()
+            print("[Typofast] timing.readCaretPoint source=focusedContext durationMs=\(String(format: "%.2f", (caretEnd - caretStart) * 1000.0))")
+            #endif
             return CGPoint(x: caretRect.maxX, y: caretRect.minY)
         }
         do {
@@ -379,6 +467,10 @@ final class GlobalSuggestionController: ObservableObject {
             #endif
             lastCursorPoint = position.point
             lastCursorUpdateTime = CFAbsoluteTimeGetCurrent()
+            #if DEBUG
+            let caretEnd = CFAbsoluteTimeGetCurrent()
+            print("[Typofast] timing.readCaretPoint source=cursorBounds durationMs=\(String(format: "%.2f", (caretEnd - caretStart) * 1000.0))")
+            #endif
             return position.point
         } catch {
             #if DEBUG
@@ -408,30 +500,47 @@ final class GlobalSuggestionController: ObservableObject {
     }
 
     private func tryUpdateOverlay(reason: String) {
+        let updateStart = CFAbsoluteTimeGetCurrent()
         let suggestion = appState.suggestion
         guard !suggestion.isEmpty else {
             overlay.hide()
             overlayMode = .hidden
-            stopOverlayRetry()
+            lastOverlayText = ""
+            lastOverlayCaret = nil
+            lastOverlayFontKey = ""
             return
         }
         let effectiveFont = focusedContext?.font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        let fontKey = "\(effectiveFont.fontName)-\(effectiveFont.pointSize)"
 
         guard let caretPoint = cursorPointWithGrace() else {
             #if DEBUG
             print("[Typofast] updateOverlay: no caret cursor available (reason=\(reason))")
             #endif
-            if CFAbsoluteTimeGetCurrent() > overlayRetryDeadline {
-                overlay.hide()
-                overlayMode = .hidden
-                stopOverlayRetry()
-            }
+            return
+        }
+
+        if suggestion == lastOverlayText,
+           fontKey == lastOverlayFontKey,
+           let lastCaret = lastOverlayCaret,
+           abs(lastCaret.x - caretPoint.x) < 0.5,
+           abs(lastCaret.y - caretPoint.y) < 0.5 {
+            #if DEBUG
+            let updateEnd = CFAbsoluteTimeGetCurrent()
+            print("[Typofast] timing.tryUpdateOverlay reason=\(reason) durationMs=\(String(format: "%.2f", (updateEnd - updateStart) * 1000.0))")
+            #endif
             return
         }
 
         overlayMode = .inline
         overlay.update(text: suggestion, font: effectiveFont, color: .systemGray, origin: caretPoint)
-        stopOverlayRetry()
+        lastOverlayText = suggestion
+        lastOverlayCaret = caretPoint
+        lastOverlayFontKey = fontKey
+        #if DEBUG
+        let updateEnd = CFAbsoluteTimeGetCurrent()
+        print("[Typofast] timing.tryUpdateOverlay reason=\(reason) durationMs=\(String(format: "%.2f", (updateEnd - updateStart) * 1000.0))")
+        #endif
         return
     }
 
@@ -499,7 +608,7 @@ final class GlobalSuggestionController: ObservableObject {
                 injectText(accepted)
                 lastAcceptedText = accepted
                 lastAcceptedRange = nil
-                appState.applyAcceptedSuggestion(accepted: accepted, newText: newText)
+                appState.applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: !acceptAll)
                 updateOverlay()
                 return true
             }
@@ -517,7 +626,7 @@ final class GlobalSuggestionController: ObservableObject {
             lastAcceptedText = accepted
             suppressNextTextChange = newText
 
-            appState.applyAcceptedSuggestion(accepted: accepted, newText: newText)
+            appState.applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: !acceptAll)
 
             focusedContext = FocusedTextContext(
                 element: context.element,
@@ -536,7 +645,7 @@ final class GlobalSuggestionController: ObservableObject {
         keyBuffer = newText
         lastAcceptedText = accepted
         lastAcceptedRange = nil
-        appState.applyAcceptedSuggestion(accepted: accepted, newText: newText)
+        appState.applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: !acceptAll)
         updateOverlay()
         return true
     }
@@ -610,7 +719,10 @@ final class GlobalSuggestionController: ObservableObject {
         } else {
             keyBuffer.append(characters)
         }
-        appState.onTextChange(keyBuffer)
+        lastKeyBufferUpdateTime = CFAbsoluteTimeGetCurrent()
+        if focusedContext == nil {
+            appState.onTextChange(keyBuffer, source: .key)
+        }
     }
 
     private func injectText(_ text: String) {
@@ -670,7 +782,7 @@ final class GlobalSuggestionController: ObservableObject {
            let axElement = AccessibilityHelpers.axElementIfAvailable(resolvedAny) {
             if let context = buildContext(from: axElement) {
                 #if DEBUG
-                print("[Typofast] fetchContext: found via AccessibilityHelpers, caretRect=\(String(describing: context.caretRect))")
+                //print("[Typofast] fetchContext: found via AccessibilityHelpers, caretRect=\(String(describing: context.caretRect))")
                 #endif
                 return context
             }
@@ -711,7 +823,7 @@ final class GlobalSuggestionController: ObservableObject {
             let context = buildContext(from: textElement)
             #if DEBUG
             if context != nil {
-                print("[Typofast] fetchContext: found via focusedElement, caretRect=\(String(describing: context?.caretRect))")
+                //print("[Typofast] fetchContext: found via focusedElement, caretRect=\(String(describing: context?.caretRect))")
             }
             #endif
             return context
@@ -721,7 +833,7 @@ final class GlobalSuggestionController: ObservableObject {
            let caretElement = findCaretElement(startingAt: focusedElement, maxDepth: 8),
            let context = buildContext(from: caretElement) {
             #if DEBUG
-            print("[Typofast] fetchContext: found via caretElement, caretRect=\(String(describing: context.caretRect))")
+            //print("[Typofast] fetchContext: found via caretElement, caretRect=\(String(describing: context.caretRect))")
             #endif
             return context
         }
@@ -738,9 +850,9 @@ final class GlobalSuggestionController: ObservableObject {
         if let textElement = resolveTextElement(startingAt: appElement) {
             let context = buildContext(from: textElement)
             #if DEBUG
-            if context != nil {
-                print("[Typofast] fetchContext: found via appElement search, caretRect=\(String(describing: context?.caretRect))")
-            }
+            //if context != nil {
+            //    print("[Typofast] fetchContext: found via appElement search, caretRect=\(String(describing: context?.caretRect))")
+            //}
             #endif
             return context
         }
@@ -930,7 +1042,6 @@ final class GlobalSuggestionController: ObservableObject {
         let role = readRole(from: element) ?? "nil"
         let editable = readEditable(from: element).map { $0 ? "true" : "false" } ?? "nil"
         let hasSelection = range != nil ? "true" : "false"
-        print("[Typofast] buildContext role=\(role) editable=\(editable) hasSelection=\(hasSelection)")
 #endif
         let font = readFont(from: element, value: value, range: range)
         return FocusedTextContext(

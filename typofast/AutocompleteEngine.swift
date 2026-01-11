@@ -13,12 +13,12 @@ struct CompletionMetrics {
 }
 
 private struct SamplingConfig {
-    var maxSuggestTokens: Int = 8
+    var maxSuggestTokens: Int = 4
     var temperature: Float = 0.15
     var topK: Int32 = 20
     var topP: Float = 0.9
     var minP: Float = 0.05
-    var repeatPenalty: Float = 1.5
+    var repeatPenalty: Float = 1.0
     var repeatLastN: Int32 = 0
     var frequencyPenalty: Float = 0.0
     var presencePenalty: Float = 0.0
@@ -42,7 +42,7 @@ private final class LlamaSamplerChain {
                 config.frequencyPenalty,
                 config.presencePenalty
             )
-        llama_sampler_chain_add(chain, penalties)
+            llama_sampler_chain_add(chain, penalties)
         }
 
         if config.topK > 0 {
@@ -103,12 +103,28 @@ actor AutocompleteEngine {
     func loadModel(path: String) async throws {
         try llama.loadModel(path: path)
         sampler = LlamaSamplerChain(config: sampling)
+        warmupKernels()
     }
 
     func getCompletion(prompt: String, inputText: String, maxTokens: Int = 10) async -> (String, CompletionMetrics) {
         generationId += 1
         let myGenerationId = generationId
+        return getCompletionSync(
+            prompt: prompt,
+            inputText: inputText,
+            maxTokens: maxTokens,
+            generationId: myGenerationId,
+            allowRetry: true
+        )
+    }
 
+    private func getCompletionSync(
+        prompt: String,
+        inputText: String,
+        maxTokens: Int,
+        generationId: Int,
+        allowRetry: Bool
+    ) -> (String, CompletionMetrics) {
         let startTime = Date()
         var metrics = CompletionMetrics()
         var ttft: Double? = nil
@@ -136,6 +152,16 @@ actor AutocompleteEngine {
                     logitsOnLast: true
                 )
             } catch {
+                if allowRetry {
+                    hardResetCache()
+                    return getCompletionSync(
+                        prompt: prompt,
+                        inputText: inputText,
+                        maxTokens: maxTokens,
+                        generationId: generationId,
+                        allowRetry: false
+                    )
+                }
                 return ("", metrics)
             }
         }
@@ -144,7 +170,7 @@ actor AutocompleteEngine {
 
         promptTokens = tokens
 
-        guard generationId == myGenerationId else {
+        guard generationId == self.generationId else {
             return ("", metrics)
         }
 
@@ -166,7 +192,7 @@ actor AutocompleteEngine {
         }
 
         for _ in 0..<maxOut {
-            if generationId != myGenerationId {
+            if generationId != self.generationId {
                 _ = llama.clearSequence(seqId: genSeqId, from: 0)
                 return ("", metrics)
             }
@@ -177,7 +203,7 @@ actor AutocompleteEngine {
             if llama.isEog(nextToken) { break }
 
             let tokenText = llama.tokenToTextAccumulating(nextToken)
-            if shouldStop(tokenText: tokenText) { break }
+            if shouldStop(tokenText: tokenText, generatedCount: generatedCount) { break }
 
             if ttft == nil {
                 ttft = Date().timeIntervalSince(startTime)
@@ -195,6 +221,16 @@ actor AutocompleteEngine {
                     logitsOnLast: true
                 )
             } catch {
+                if allowRetry {
+                    hardResetCache()
+                    return getCompletionSync(
+                        prompt: prompt,
+                        inputText: inputText,
+                        maxTokens: maxTokens,
+                        generationId: generationId,
+                        allowRetry: false
+                    )
+                }
                 break
             }
 
@@ -217,9 +253,34 @@ actor AutocompleteEngine {
     }
 
     func resetCache() async {
+        hardResetCache()
+    }
+
+    private func hardResetCache() {
         _ = llama.clearSequence(seqId: promptSeqId, from: 0)
         _ = llama.clearSequence(seqId: genSeqId, from: 0)
         promptTokens = []
+        llama.clearInvalidBytes()
+    }
+
+    private func warmupKernels() {
+        let warmupText = "Hello"
+        let tokens = llama.tokenize(text: warmupText, addBos: true)
+        guard !tokens.isEmpty else { return }
+
+        let positions = tokens.indices.map { Int32($0) }
+        do {
+            try llama.decode(tokens: tokens, positions: positions, seqId: promptSeqId, logitsOnLast: true)
+        } catch {
+            _ = llama.clearSequence(seqId: promptSeqId, from: 0)
+            promptTokens = []
+            return
+        }
+
+        llama.synchronize()
+        _ = llama.clearSequence(seqId: promptSeqId, from: 0)
+        promptTokens = []
+        llama.clearInvalidBytes()
     }
 
     private func findCommonPrefixLength(newTokens: [Int32]) -> Int {
@@ -234,13 +295,16 @@ actor AutocompleteEngine {
         return commonLength
     }
 
-    private func shouldStop(tokenText: String) -> Bool {
+    private func shouldStop(tokenText: String, generatedCount: Int) -> Bool {
         if tokenText.isEmpty { return false }
-        if tokenText.contains("\n") { return true }
+        if generatedCount == 0,
+           tokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return false
+        }
+        if tokenText.contains("\n") { return generatedCount > 0 }
         if tokenText == "</s>" { return true }
-        if tokenText.contains("  ") { return true }
         if tokenText.contains(".") || tokenText.contains("!") || tokenText.contains("?") {
-            return true
+            return generatedCount > 0
         }
         return false
     }

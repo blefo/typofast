@@ -57,7 +57,7 @@ final class SuggestionOverlayWindow: NSPanel {
         let windowFrame = CGRect(x: origin.x, y: origin.y, width: width, height: height)
 
         #if DEBUG
-        print("[Typofast] SuggestionOverlay: setting frame=\(windowFrame) text=\"\(text.prefix(20))...\"")
+        //print("[Typofast] SuggestionOverlay: setting frame=\(windowFrame) text=\"\(text.prefix(20))...\"")
         #endif
 
         let point = origin
@@ -81,7 +81,7 @@ final class SuggestionOverlayWindow: NSPanel {
         let wf = frame
         let screens = NSScreen.screens.map { $0.frame }
         let onAnyScreen = NSScreen.screens.contains { $0.frame.intersects(wf) }
-        print("[Typofast] Overlay state visible=\(isVisible) alpha=\(alphaValue) level=\(level.rawValue) frame=\(wf) onAnyScreen=\(onAnyScreen) screens=\(screens)")
+        //print("[Typofast] Overlay state visible=\(isVisible) alpha=\(alphaValue) level=\(level.rawValue) frame=\(wf) onAnyScreen=\(onAnyScreen) screens=\(screens)")
         #endif
     }
 

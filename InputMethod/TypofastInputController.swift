@@ -9,10 +9,12 @@ final class TypofastInputController: IMKInputController {
     private var suggestionOffset = 0
     private var lastAcceptedText = ""
     private var pendingTask: Task<Void, Never>?
+    private var debounceTask: Task<Void, Never>?
     private var isAccepting = false
     private var syncTask: Task<Void, Never>?
 
     private let grayColor = NSColor.secondaryLabelColor
+    private let debounceDelayNs: UInt64 = 50_000_000
 
     override func inputText(_ string: String!, key keyCode: Int, modifiers flags: Int) -> Bool {
         guard let string else { return false }
@@ -233,6 +235,7 @@ final class TypofastInputController: IMKInputController {
         currentText = newText
         lastText = newText
         pendingTask?.cancel()
+        debounceTask?.cancel()
 
         if newText.isEmpty {
             clearSuggestion()
@@ -245,14 +248,21 @@ final class TypofastInputController: IMKInputController {
         }
 
         let modelPrompt = trimTrailingSpaces(newText)
-        pendingTask = Task { @MainActor in
-            let (completion, _) = await InputMethodEngine.shared.getSuggestion(prompt: modelPrompt, inputText: newText)
+        debounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: debounceDelayNs)
+            guard !Task.isCancelled else { return }
             guard newText == currentText else { return }
-            let sanitized = sanitizeSuggestion(completion, forPrompt: newText)
-            suggestionBase = sanitized
-            suggestionOffset = 0
-            suggestion = sanitized
-            updateSuggestion(sanitized)
+            pendingTask?.cancel()
+            pendingTask = Task { @MainActor in
+                let (completion, _) = await InputMethodEngine.shared.getSuggestion(prompt: modelPrompt, inputText: newText)
+                guard newText == currentText else { return }
+                let sanitized = sanitizeSuggestion(completion, forPrompt: newText)
+                suggestionBase = sanitized
+                suggestionOffset = 0
+                suggestion = sanitized
+                updateSuggestion(sanitized)
+            }
+            await pendingTask?.value
         }
     }
 
