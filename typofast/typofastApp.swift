@@ -14,8 +14,13 @@ struct typofastApp: App {
 
     init() {
         let state = AppState()
+        let controller = GlobalSuggestionController(appState: state)
         _appState = StateObject(wrappedValue: state)
-        _globalController = StateObject(wrappedValue: GlobalSuggestionController(appState: state))
+        _globalController = StateObject(wrappedValue: controller)
+
+        Task { @MainActor in
+            controller.start()
+        }
     }
 
     var body: some Scene {

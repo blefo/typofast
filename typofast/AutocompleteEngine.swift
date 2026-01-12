@@ -13,7 +13,7 @@ struct CompletionMetrics {
 }
 
 private struct SamplingConfig {
-    var maxSuggestTokens: Int = 4
+    var maxSuggestTokens: Int = 14
     var temperature: Float = 0.15
     var topK: Int32 = 20
     var topP: Float = 0.9

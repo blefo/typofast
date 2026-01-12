@@ -8,6 +8,27 @@ enum TextChangeSource {
     case `internal`
 }
 
+/// Thread-safe atomic counter for tracking key presses across threads
+final class AtomicKeyPressCounter: @unchecked Sendable {
+    private var _value: Int64 = 0
+    private let lock = NSLock()
+
+    var value: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _value
+    }
+
+    func increment() {
+        lock.lock()
+        _value += 1
+        lock.unlock()
+        #if DEBUG
+        print("[Typofast] keyPressCounter incremented to \(_value)")
+        #endif
+    }
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var engine: AutocompleteEngine?
@@ -25,6 +46,10 @@ class AppState: ObservableObject {
     @Published var modelPath: String?
     @Published var disabledApps: [DisabledAppEntry] = []
     @Published var isGenerating = false
+    @Published var windowContext: WindowTextContext?
+    @Published var suggestedWordsCount: Int = 0
+    @Published var acceptedWordsCount: Int = 0
+    @Published var ocrContextEnabled: Bool = true
 
     private var inferenceTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
@@ -35,14 +60,22 @@ class AppState: ObservableObject {
     private var inFlightRequestId: UUID?
     private var suggestionAnchor = ""
     private var suppressNextInference = false
+    /// Atomic counter that can be safely incremented from any thread (event tap callback)
+    /// and read from MainActor without race conditions
+    let keyPressCounter = AtomicKeyPressCounter()
     private var metricsObserver: NSObjectProtocol?
     private var disabledAppsById: [String: String] = [:]
     private let disabledAppsKey = "typofast.disabledApps"
+    private let suggestedWordsKey = "typofast.suggestedWordsCount"
+    private let acceptedWordsKey = "typofast.acceptedWordsCount"
+    private let ocrContextEnabledKey = "typofast.ocrContextEnabled"
     private let defaultModelPath = "/Users/baptistelefort/Downloads/Qwen3-1.7B-Base.i1-Q4_K_M.gguf"
     private let debounceDelayNs: UInt64 = 0_000_000
 
     init() {
+        loadAcceptanceStats()
         loadDisabledApps()
+        loadOcrContextEnabled()
         loadDefaultModelIfNeeded()
         metricsObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("TypofastMetricsUpdate"),
@@ -101,6 +134,17 @@ class AppState: ObservableObject {
         metrics = nil
     }
 
+    func updateWindowContext(_ context: WindowTextContext?) {
+        windowContext = context
+    }
+
+    /// Called immediately when a key is pressed, before onTextChange.
+    /// This allows us to detect if keys were pressed while a completion was in flight.
+    /// Note: This can be called from any thread (event tap callback) - the counter is atomic.
+    nonisolated func notifyKeyPressed() {
+        keyPressCounter.increment()
+    }
+
     private func applyMetrics(_ updated: CompletionMetrics) {
         metrics = updated
         guard updated.ttft > 0 || updated.tokensPerSecond > 0 || updated.cachedTokensReused > 0 else { return }
@@ -109,6 +153,35 @@ class AppState: ObservableObject {
         averageTtft = ((averageTtft * (count - 1)) + updated.ttft) / count
         averageTokensPerSecond = ((averageTokensPerSecond * (count - 1)) + updated.tokensPerSecond) / count
         averageCachedTokensReused = ((averageCachedTokensReused * (count - 1)) + Double(updated.cachedTokensReused)) / count
+    }
+
+    private func loadAcceptanceStats() {
+        suggestedWordsCount = UserDefaults.standard.integer(forKey: suggestedWordsKey)
+        acceptedWordsCount = UserDefaults.standard.integer(forKey: acceptedWordsKey)
+    }
+
+    private func persistAcceptanceStats() {
+        UserDefaults.standard.set(suggestedWordsCount, forKey: suggestedWordsKey)
+        UserDefaults.standard.set(acceptedWordsCount, forKey: acceptedWordsKey)
+    }
+
+    private func wordCount(in text: String) -> Int {
+        let parts = text.split { $0.isWhitespace || $0.isNewline }
+        return parts.count
+    }
+
+    private func addSuggestedWords(from suggestion: String) {
+        let count = wordCount(in: suggestion)
+        guard count > 0 else { return }
+        suggestedWordsCount += count
+        persistAcceptanceStats()
+    }
+
+    private func addAcceptedWords(from accepted: String) {
+        let count = wordCount(in: accepted)
+        guard count > 0 else { return }
+        acceptedWordsCount += count
+        persistAcceptanceStats()
     }
 
     func loadModel(path: String) async {
@@ -267,12 +340,27 @@ class AppState: ObservableObject {
     private func requestCompletion(_ text: String, requestId: UUID) async {
         guard let engine = engine else { return }
 
+        // Capture the key press counter at request start
+        // If any key is pressed during the request, this counter will change
+        // This is atomic and can be updated from the event tap thread synchronously
+        let startKeyCount = keyPressCounter.value
+
         let systemPrompt = """
         User context: My name is Baptiste Lefort. I usually write in English and French.
-        Write causually with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
+        Write causally with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
         """
         let trimmedText = trimTrailingSpaces(text)
-        let modelPrompt = "\(systemPrompt)\n\(trimmedText)"
+        var promptParts: [String] = [systemPrompt]
+        if let context = windowContext, !context.text.isEmpty {
+            promptParts.append(context.promptBlock(maxTextLength: 1200))
+            logEvent("contextUsed", [
+                "source": context.source.rawValue,
+                "len": "\(context.text.count)",
+                "title": context.windowTitle ?? ""
+            ])
+        }
+        promptParts.append(trimmedText)
+        let modelPrompt = promptParts.joined(separator: "\n\n")
         logEvent("requestCompletion", [
             "text": text,
             "modelPrompt": modelPrompt
@@ -283,7 +371,22 @@ class AppState: ObservableObject {
             inputText: text,
             maxTokens: 6
         )
+
+        // Check if this request was cancelled while waiting
+        guard !Task.isCancelled else { return }
         guard inFlightRequestId == requestId else { return }
+
+        // Check if any key was pressed during the request
+        // The atomic counter is updated synchronously from the event tap callback thread,
+        // so this check is reliable without any timing delays
+        let currentKeyCount = keyPressCounter.value
+        guard currentKeyCount == startKeyCount else {
+            #if DEBUG
+            print("[Typofast] discarding completion: keyCount changed from \(startKeyCount) to \(currentKeyCount)")
+            #endif
+            return
+        }
+
         let generationEnd = CFAbsoluteTimeGetCurrent()
         logEvent("timing.engineCompletion", [
             "durationMs": String(format: "%.2f", (generationEnd - generationStart) * 1000.0),
@@ -292,27 +395,27 @@ class AppState: ObservableObject {
             "ttft": String(format: "%.2f", completionMetrics.ttft * 1000.0)
         ])
 
-        // Only update if text hasn't changed
-        if text == currentText {
-            lastAppliedSuggestion = completion
-            if completion.isEmpty {
-                lastEmptyCompletionInput = text
-            } else {
-                lastEmptyCompletionInput = nil
-            }
-            suggestionBase = completion
-            suggestionOffset = 0
-            suggestion = completion
-            suggestionAnchor = text
-            logEvent("completionReceived", [
-                "raw": completion,
-                "sanitized": completion
-            ])
-            logEvent("timing.suggestionApplied", [
-                "suggestionLength": "\(completion.count)"
-            ])
-            applyMetrics(completionMetrics)
+        lastAppliedSuggestion = completion
+        if completion.isEmpty {
+            lastEmptyCompletionInput = text
+        } else {
+            lastEmptyCompletionInput = nil
         }
+        suggestionBase = completion
+        suggestionOffset = 0
+        suggestion = completion
+        suggestionAnchor = text
+        if !completion.isEmpty {
+            addSuggestedWords(from: completion)
+        }
+        logEvent("completionReceived", [
+            "raw": completion,
+            "sanitized": completion
+        ])
+        logEvent("timing.suggestionApplied", [
+            "suggestionLength": "\(completion.count)"
+        ])
+        applyMetrics(completionMetrics)
     }
 
     func acceptSuggestion() -> String {
@@ -343,6 +446,8 @@ class AppState: ObservableObject {
 
     func applyAcceptedSuggestion(accepted: String, newText: String, keepRemaining: Bool) {
         guard !accepted.isEmpty else { return }
+
+        addAcceptedWords(from: accepted)
 
         if keepRemaining, !suggestionBase.isEmpty {
             suggestionOffset += accepted.count
@@ -511,6 +616,19 @@ class AppState: ObservableObject {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    private func loadOcrContextEnabled() {
+        if UserDefaults.standard.object(forKey: ocrContextEnabledKey) == nil {
+            ocrContextEnabled = true
+        } else {
+            ocrContextEnabled = UserDefaults.standard.bool(forKey: ocrContextEnabledKey)
+        }
+    }
+
+    func setOcrContextEnabled(_ enabled: Bool) {
+        ocrContextEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: ocrContextEnabledKey)
+    }
+
     var modelDisplayName: String {
         URL(fileURLWithPath: modelPath ?? defaultModelPath).lastPathComponent
     }
@@ -551,12 +669,17 @@ struct ContentView: View {
                     .font(.system(.body, design: .rounded))
                     .foregroundColor(permissionsOk() ? .secondary : .primary)
             }
+
+            sectionView(title: "OCR Context", systemImage: "eye") {
+                Toggle("Enable OCR context", isOn: Binding(
+                    get: { appState.ocrContextEnabled },
+                    set: { appState.setOcrContextEnabled($0) }
+                ))
+                .font(.system(.body, design: .rounded))
+            }
         }
         .padding(14)
-        .frame(width: 360, height: 220)
-        .onAppear {
-            globalController.start()
-        }
+        .frame(width: 360, height: 280)
     }
 
     private func permissionsOk() -> Bool {
@@ -582,14 +705,23 @@ struct ContentView: View {
         return "Missing: " + missing.joined(separator: ", ")
     }
 
-    private func statsContent() -> Text {
-        if appState.metricsSamples > 0 {
-            return Text("Avg TTFT \(String(format: "%.0f", appState.averageTtft * 1000)) ms  •  Avg \(String(format: "%.1f", appState.averageTokensPerSecond)) tok/s  •  Avg Cache \(String(format: "%.1f", appState.averageCachedTokensReused))")
+    private func statsContent() -> some View {
+        let acceptancePercent = appState.suggestedWordsCount > 0
+            ? (Double(appState.acceptedWordsCount) / Double(appState.suggestedWordsCount)) * 100.0
+            : 0.0
+        return VStack(alignment: .leading, spacing: 4) {
+            if appState.metricsSamples > 0 {
+                Text("Avg TTFT \(String(format: "%.0f", appState.averageTtft * 1000)) ms  •  Avg \(String(format: "%.1f", appState.averageTokensPerSecond)) tok/s  •  Avg Cache \(String(format: "%.1f", appState.averageCachedTokensReused))")
+                    .font(.system(.body, design: .rounded))
+            } else {
+                Text(appState.isLoading ? "Loading…" : "No stats yet")
+                    .font(.system(.body, design: .rounded))
+                    .foregroundColor(.secondary)
+            }
+            Text("Acceptance \(String(format: "%.0f", acceptancePercent))%  •  Suggested \(appState.suggestedWordsCount) words  •  Accepted \(appState.acceptedWordsCount) words")
                 .font(.system(.body, design: .rounded))
+                .foregroundColor(.secondary)
         }
-        return Text(appState.isLoading ? "Loading…" : "No stats yet")
-            .font(.system(.body, design: .rounded))
-            .foregroundColor(.secondary)
     }
 
     private func sectionView<Content: View>(

@@ -17,6 +17,7 @@ final class GlobalSuggestionController: ObservableObject {
     private let overlay = SuggestionOverlayWindow()
     private let cursorBounds = CursorBounds()
     private let ownBundleId = Bundle.main.bundleIdentifier
+    private let windowContextExtractor = WindowContextExtractor()
     private var pollTimer: Timer?
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
@@ -42,6 +43,10 @@ final class GlobalSuggestionController: ObservableObject {
     private var lastOverlayText: String = ""
     private var lastOverlayCaret: CGPoint?
     private var lastOverlayFontKey: String = ""
+    private var lastWindowContextKey: String = ""
+    private var windowContextTask: Task<Void, Never>?
+    private var lastWindowContextCaptureTime: CFAbsoluteTime = 0
+    private var workspaceObserver: NSObjectProtocol?
     private var cancellables = Set<AnyCancellable>()
 
     init(appState: AppState) {
@@ -60,18 +65,32 @@ final class GlobalSuggestionController: ObservableObject {
             .store(in: &cancellables)
     }
 
+    deinit {
+        if let observer = workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+    }
+
     func start() {
         accessibilityEnabled = CursorBounds.isAccessibilityEnabled()
         screenRecordingEnabled = Self.hasScreenRecordingPermission()
         logSandboxStatus()
-        #if DEBUG
-        print("[Typofast] accessibilityEnabled=\(accessibilityEnabled) screenRecordingEnabled=\(screenRecordingEnabled)")
-        #endif
         startEventTapIfNeeded()
         startPolling()
         if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier {
             updateAXObserver(for: pid)
             registerElementNotificationsIfNeeded()
+        }
+
+        if workspaceObserver == nil {
+            workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.updateWindowContextIfNeeded(trigger: .window, frontmostApp: NSWorkspace.shared.frontmostApplication)
+            }
         }
     }
 
@@ -187,6 +206,7 @@ final class GlobalSuggestionController: ObservableObject {
             overlay.hide()
             overlayMode = .hidden
             focusedContext = nil
+            appState.updateWindowContext(nil)
             return
         }
 
@@ -199,12 +219,14 @@ final class GlobalSuggestionController: ObservableObject {
             overlayMode = .hidden
             focusedContext = nil
             appState.clearSuggestion()
+            appState.updateWindowContext(nil)
             return
         }
 
         if !inputMonitoringEnabled {
             startEventTapIfNeeded()
         }
+        updateWindowContextIfNeeded(trigger: trigger, frontmostApp: frontmostApp)
         guard accessibilityEnabled else {
             overlay.hide()
             overlayMode = .hidden
@@ -213,10 +235,7 @@ final class GlobalSuggestionController: ObservableObject {
 
         let context = fetchFocusedTextContextSync()
         applyFocusedContext(context, trigger: trigger)
-        let refreshEnd = CFAbsoluteTimeGetCurrent()
-        #if DEBUG
-        print("[Typofast] timing.refreshFocusedText trigger=\(trigger) durationMs=\(String(format: "%.2f", (refreshEnd - refreshStart) * 1000.0))")
-        #endif
+        _ = refreshStart
     }
 
     private func updateAXObserver(for pid: pid_t) {
@@ -402,6 +421,74 @@ final class GlobalSuggestionController: ObservableObject {
         }
     }
 
+    private func updateWindowContextIfNeeded(trigger: RefreshTrigger, frontmostApp: NSRunningApplication?) {
+        guard let frontmostApp else {
+            appState.updateWindowContext(nil)
+            return
+        }
+        if let ownBundleId,
+           frontmostApp.bundleIdentifier == ownBundleId {
+            appState.updateWindowContext(nil)
+            return
+        }
+        if let bundleId = frontmostApp.bundleIdentifier, appState.isAppDisabled(bundleId: bundleId) {
+            appState.updateWindowContext(nil)
+            return
+        }
+
+        screenRecordingEnabled = Self.hasScreenRecordingPermission()
+        guard screenRecordingEnabled else {
+            appState.updateWindowContext(nil)
+            return
+        }
+
+        windowContextTask?.cancel()
+        let appName = frontmostApp.localizedName ?? frontmostApp.bundleIdentifier ?? "Unknown"
+        windowContextTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            guard let identity = await self.windowContextExtractor.frontmostWindowIdentity(for: frontmostApp) else {
+                await MainActor.run {
+                    self.appState.updateWindowContext(nil)
+                    self.logWindowContext("capture skipped no-window app=\"\(appName)\"")
+                }
+                return
+            }
+            let key = "\(frontmostApp.bundleIdentifier ?? "unknown")|\(identity.windowId)"
+            let shouldCapture = await MainActor.run { () -> Bool in
+                let now = CFAbsoluteTimeGetCurrent()
+                let refreshInterval: CFAbsoluteTime = 2.0
+                let windowChanged = key != self.lastWindowContextKey
+                let stale = now - self.lastWindowContextCaptureTime >= refreshInterval
+                guard windowChanged || stale else { return false }
+                if windowChanged {
+                    self.appState.updateWindowContext(nil)
+                }
+                self.lastWindowContextKey = key
+                self.lastWindowContextCaptureTime = now
+                return true
+            }
+            guard shouldCapture else { return }
+
+            await self.logWindowContext("capture start app=\"\(appName)\" title=\"\(identity.title ?? "Unknown")\" trigger=\(trigger)")
+            let caretRegion = await MainActor.run { () -> CGRect? in
+                return self.focusedContext?.caretRect
+            }
+            let context = await self.windowContextExtractor.extract(
+                frontmostApp: frontmostApp,
+                allowOCR: await MainActor.run { self.appState.ocrContextEnabled },
+                caretRegion: caretRegion
+            )
+            await MainActor.run {
+                self.appState.updateWindowContext(context)
+                if let context {
+                    self.logWindowContext("capture done source=\(context.source.rawValue) len=\(context.text.count) app=\"\(context.appName)\" title=\"\(context.windowTitle ?? "Unknown")\"")
+                } else {
+                    self.logWindowContext("capture done empty app=\"\(appName)\" title=\"\(identity.title ?? "Unknown")\"")
+                }
+            }
+        }
+    }
+
     private func normalizeObservedValue(_ value: String) -> String {
         if value.hasSuffix("\r\n") {
             let trimmed = value.dropLast(2)
@@ -424,10 +511,7 @@ final class GlobalSuggestionController: ObservableObject {
         }
         let overlayStart = CFAbsoluteTimeGetCurrent()
         tryUpdateOverlay(reason: "updateOverlay")
-        let overlayEnd = CFAbsoluteTimeGetCurrent()
-        #if DEBUG
-        print("[Typofast] timing.updateOverlay durationMs=\(String(format: "%.2f", (overlayEnd - overlayStart) * 1000.0))")
-        #endif
+        _ = overlayStart
     }
 
     private func cursorPointWithGrace() -> CGPoint? {
@@ -442,12 +526,7 @@ final class GlobalSuggestionController: ObservableObject {
     }
 
     private func readCaretPoint() -> CGPoint? {
-        let caretStart = CFAbsoluteTimeGetCurrent()
         if let caretRect = focusedContext?.caretRect {
-            #if DEBUG
-            let caretEnd = CFAbsoluteTimeGetCurrent()
-            print("[Typofast] timing.readCaretPoint source=focusedContext durationMs=\(String(format: "%.2f", (caretEnd - caretStart) * 1000.0))")
-            #endif
             return CGPoint(x: caretRect.maxX, y: caretRect.minY)
         }
         do {
@@ -455,48 +534,23 @@ final class GlobalSuggestionController: ObservableObject {
                 correctionMode: .none,
                 corner: .bottomRight
             )
-            #if DEBUG
-            let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
-            print("[Typofast] cursorPosition type=\(position.type) point=\(position.point) bounds=\(position.bounds) frontmost=\(frontmost)")
-            #endif
             guard position.type == CursorType.textCaret else {
                 return nil
             }
-            #if DEBUG
-            print("[Typofast] resolvedCaretPoint=\(position.point) type=\(position.type)")
-            #endif
             lastCursorPoint = position.point
             lastCursorUpdateTime = CFAbsoluteTimeGetCurrent()
-            #if DEBUG
-            let caretEnd = CFAbsoluteTimeGetCurrent()
-            print("[Typofast] timing.readCaretPoint source=cursorBounds durationMs=\(String(format: "%.2f", (caretEnd - caretStart) * 1000.0))")
-            #endif
             return position.point
         } catch {
-            #if DEBUG
-            print("[Typofast] cursorPosition error: \(error)")
-            #endif
             return nil
         }
     }
 
     private func logSandboxStatus() {
         guard let task = SecTaskCreateFromSelf(nil) else {
-            #if DEBUG
-            print("[Typofast] appSandbox entitlement=unavailable")
-            #endif
             return
         }
         let key = "com.apple.security.app-sandbox" as CFString
-        if let value = SecTaskCopyValueForEntitlement(task, key, nil) {
-            #if DEBUG
-            print("[Typofast] appSandbox entitlement=\(value)")
-            #endif
-        } else {
-            #if DEBUG
-            print("[Typofast] appSandbox entitlement=missing")
-            #endif
-        }
+        _ = SecTaskCopyValueForEntitlement(task, key, nil)
     }
 
     private func tryUpdateOverlay(reason: String) {
@@ -514,9 +568,6 @@ final class GlobalSuggestionController: ObservableObject {
         let fontKey = "\(effectiveFont.fontName)-\(effectiveFont.pointSize)"
 
         guard let caretPoint = cursorPointWithGrace() else {
-            #if DEBUG
-            print("[Typofast] updateOverlay: no caret cursor available (reason=\(reason))")
-            #endif
             return
         }
 
@@ -525,10 +576,7 @@ final class GlobalSuggestionController: ObservableObject {
            let lastCaret = lastOverlayCaret,
            abs(lastCaret.x - caretPoint.x) < 0.5,
            abs(lastCaret.y - caretPoint.y) < 0.5 {
-            #if DEBUG
-            let updateEnd = CFAbsoluteTimeGetCurrent()
-            print("[Typofast] timing.tryUpdateOverlay reason=\(reason) durationMs=\(String(format: "%.2f", (updateEnd - updateStart) * 1000.0))")
-            #endif
+            _ = updateStart
             return
         }
 
@@ -537,11 +585,7 @@ final class GlobalSuggestionController: ObservableObject {
         lastOverlayText = suggestion
         lastOverlayCaret = caretPoint
         lastOverlayFontKey = fontKey
-        #if DEBUG
-        let updateEnd = CFAbsoluteTimeGetCurrent()
-        print("[Typofast] timing.tryUpdateOverlay reason=\(reason) durationMs=\(String(format: "%.2f", (updateEnd - updateStart) * 1000.0))")
-        #endif
-        return
+        _ = updateStart
     }
 
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -582,12 +626,19 @@ final class GlobalSuggestionController: ObservableObject {
         }
 
         if !characters.isEmpty {
+            // Notify immediately that a key was pressed - this invalidates any in-flight completions
+            appState.notifyKeyPressed()
             lastAcceptedRange = nil
             lastAcceptedText = ""
             updateKeyBuffer(with: characters, keycode: keycode)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
                 self?.refreshFocusedText(trigger: .key)
             }
+        }
+
+        // Also notify for backspace since it modifies text
+        if keycode == 51 {
+            appState.notifyKeyPressed()
         }
 
         return Unmanaged.passUnretained(event)
@@ -781,87 +832,45 @@ final class GlobalSuggestionController: ObservableObject {
            let resolvedAny = AccessibilityHelpers.resolveEditableElement(from: focusedAny),
            let axElement = AccessibilityHelpers.axElementIfAvailable(resolvedAny) {
             if let context = buildContext(from: axElement) {
-                #if DEBUG
-                //print("[Typofast] fetchContext: found via AccessibilityHelpers, caretRect=\(String(describing: context.caretRect))")
-                #endif
                 return context
             }
         }
 
         guard let appElement = copyAXElement(systemWide, attribute: kAXFocusedApplicationAttribute as CFString)
             ?? copyFrontmostAppElement() else {
-            #if DEBUG
-            print("[Typofast] fetchContext: no app element")
-            #endif
             return nil
         }
 
-#if DEBUG
-        if let focusedWindow = copyAXElement(appElement, attribute: kAXFocusedWindowAttribute as CFString) {
-            var frameRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(focusedWindow, "AXFrame" as CFString, &frameRef) == .success,
-               let frameRef,
-               CFGetTypeID(frameRef) == AXValueGetTypeID() {
-                var frame = CGRect.zero
-                if AXValueGetValue(frameRef as! AXValue, .cgRect, &frame) {
-                    print("[Typofast] focusedWindow frame=\(frame)")
-                }
-            }
-        }
-#endif
-
         if let focusedElement = copyAXElement(appElement, attribute: kAXFocusedUIElementAttribute as CFString),
            let directContext = buildContext(from: focusedElement) {
-            #if DEBUG
-            print("[Typofast] fetchContext: direct focusedElement, caretRect=\(String(describing: directContext.caretRect))")
-            #endif
             return directContext
         }
 
         if let focusedElement = copyAXElement(appElement, attribute: kAXFocusedUIElementAttribute as CFString),
            let textElement = resolveTextElement(startingAt: focusedElement) {
             let context = buildContext(from: textElement)
-            #if DEBUG
-            if context != nil {
-                //print("[Typofast] fetchContext: found via focusedElement, caretRect=\(String(describing: context?.caretRect))")
-            }
-            #endif
             return context
         }
 
         if let focusedElement = copyAXElement(appElement, attribute: kAXFocusedUIElementAttribute as CFString),
            let caretElement = findCaretElement(startingAt: focusedElement, maxDepth: 8),
            let context = buildContext(from: caretElement) {
-            #if DEBUG
-            //print("[Typofast] fetchContext: found via caretElement, caretRect=\(String(describing: context.caretRect))")
-            #endif
             return context
         }
 
         if let focusedElement = copyAXElement(appElement, attribute: kAXFocusedUIElementAttribute as CFString),
            let fallbackContext = buildContext(from: focusedElement),
            fallbackContext.elementFrame != nil {
-            #if DEBUG
-            print("[Typofast] fetchContext: fallback to focusedElement frame, caretRect=\(String(describing: fallbackContext.caretRect))")
-            #endif
             return fallbackContext
         }
 
         if let textElement = resolveTextElement(startingAt: appElement) {
             let context = buildContext(from: textElement)
-            #if DEBUG
-            //if context != nil {
-            //    print("[Typofast] fetchContext: found via appElement search, caretRect=\(String(describing: context?.caretRect))")
-            //}
-            #endif
             return context
         }
 
         if let focusedWindow = copyAXElement(appElement, attribute: kAXFocusedWindowAttribute as CFString),
            let windowFrame = readElementFrame(from: focusedWindow) {
-            #if DEBUG
-            print("[Typofast] fetchContext: fallback to focusedWindow frame, frame=\(windowFrame)")
-            #endif
             return FocusedTextContext(
                 element: focusedWindow,
                 value: nil,
@@ -872,9 +881,6 @@ final class GlobalSuggestionController: ObservableObject {
             )
         }
 
-        #if DEBUG
-        print("[Typofast] fetchContext: no text element found")
-        #endif
         return nil
     }
 
@@ -1360,15 +1366,22 @@ final class GlobalSuggestionController: ObservableObject {
         }
         return true
     }
+
+    private func logWindowContext(_ message: String) {
+        #if DEBUG
+        print("[Typofast] context \(message)")
+        #endif
+    }
 }
 
 private enum RefreshTrigger {
     case timer
     case key
     case ax
+    case window
 }
 
-private struct FocusedTextContext {
+struct FocusedTextContext {
     let element: AXUIElement
     let value: String?
     let selectedRange: CFRange?
