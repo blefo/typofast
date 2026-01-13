@@ -70,6 +70,10 @@ class AppState: ObservableObject {
     private let disabledAppsKey = "typofast.disabledApps"
     private let suggestedWordsKey = "typofast.suggestedWordsCount"
     private let acceptedWordsKey = "typofast.acceptedWordsCount"
+    private let averageTtftKey = "typofast.averageTtft"
+    private let averageTokensPerSecondKey = "typofast.averageTokensPerSecond"
+    private let averageCachedTokensReusedKey = "typofast.averageCachedTokensReused"
+    private let metricsSamplesKey = "typofast.metricsSamples"
     private let ocrContextEnabledKey = "typofast.ocrContextEnabled"
     private let systemPromptKey = "typofast.systemPrompt"
     private let defaultModelPath = "/Users/baptistelefort/Downloads/Qwen3-1.7B-Base.i1-Q4_K_M.gguf"
@@ -81,6 +85,7 @@ class AppState: ObservableObject {
 
     init() {
         loadAcceptanceStats()
+        loadPerformanceStats()
         loadDisabledApps()
         loadOcrContextEnabled()
         loadSystemPrompt()
@@ -161,6 +166,7 @@ class AppState: ObservableObject {
         averageTtft = ((averageTtft * (count - 1)) + updated.ttft) / count
         averageTokensPerSecond = ((averageTokensPerSecond * (count - 1)) + updated.tokensPerSecond) / count
         averageCachedTokensReused = ((averageCachedTokensReused * (count - 1)) + Double(updated.cachedTokensReused)) / count
+        persistPerformanceStats()
     }
 
     private func loadAcceptanceStats() {
@@ -178,6 +184,24 @@ class AppState: ObservableObject {
         acceptedWordsCount = 0
         UserDefaults.standard.removeObject(forKey: suggestedWordsKey)
         UserDefaults.standard.removeObject(forKey: acceptedWordsKey)
+    }
+
+    private func loadPerformanceStats() {
+        metricsSamples = UserDefaults.standard.integer(forKey: metricsSamplesKey)
+        averageTtft = UserDefaults.standard.double(forKey: averageTtftKey)
+        averageTokensPerSecond = UserDefaults.standard.double(forKey: averageTokensPerSecondKey)
+        averageCachedTokensReused = UserDefaults.standard.double(forKey: averageCachedTokensReusedKey)
+        if metricsSamples == 0,
+           averageTtft > 0 || averageTokensPerSecond > 0 || averageCachedTokensReused > 0 {
+            metricsSamples = 1
+        }
+    }
+
+    private func persistPerformanceStats() {
+        UserDefaults.standard.set(metricsSamples, forKey: metricsSamplesKey)
+        UserDefaults.standard.set(averageTtft, forKey: averageTtftKey)
+        UserDefaults.standard.set(averageTokensPerSecond, forKey: averageTokensPerSecondKey)
+        UserDefaults.standard.set(averageCachedTokensReused, forKey: averageCachedTokensReusedKey)
     }
 
     private func wordCount(in text: String) -> Int {
@@ -770,135 +794,321 @@ struct DisabledAppEntry: Identifiable, Hashable {
 
 struct ContentView: View {
     @ObservedObject var appState: AppState
-    @ObservedObject var globalController: GlobalSuggestionController
+    @State private var isEditingPrompt = false
+    @State private var isEditingRestrictions = false
+    @State private var runningApps: [(bundleId: String, name: String)] = []
 
     var body: some View {
-        VStack(spacing: 10) {
-            sectionView(title: "Model", systemImage: "brain") {
-                Text(appState.modelDisplayName)
-                    .font(.system(.body, design: .rounded))
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        let tileSpacing: CGFloat = 8
+        let panelWidth: CGFloat = 320
+        let horizontalPadding: CGFloat = 12
+        let contentWidth = panelWidth - (horizontalPadding * 2)
+        let columnWidth = (contentWidth - tileSpacing) / 2
+        let smallTileHeight: CGFloat = 80
 
-            sectionView(title: "Statistics", systemImage: "speedometer") {
-                statsContent()
-            }
+        return VStack(spacing: tileSpacing) {
+            // Row 1: Header + TTFT
+            HStack(spacing: tileSpacing) {
+                tileView(backgroundColor: statusTileColor()) {
+                    headerView()
+                }
+                .frame(width: columnWidth, height: smallTileHeight)
 
-            sectionView(title: "Permissions", systemImage: "checkmark.seal") {
-                Text(permissionsStatusText())
-                    .font(.system(.body, design: .rounded))
-                    .foregroundColor(permissionsOk() ? .secondary : .primary)
-            }
-
-            sectionView(title: "OCR Context", systemImage: "eye") {
-                Toggle("Enable OCR context", isOn: Binding(
-                    get: { appState.ocrContextEnabled },
-                    set: { appState.setOcrContextEnabled($0) }
-                ))
-                .font(.system(.body, design: .rounded))
-            }
-
-            sectionView(title: "System Prompt", systemImage: "text.bubble") {
-                TextEditor(text: Binding(
-                    get: { appState.systemPrompt },
-                    set: { appState.setSystemPrompt($0) }
-                ))
-                .font(.system(.body, design: .rounded))
-                .frame(height: 80)
-                .scrollContentBackground(.hidden)
-                .padding(4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color(NSColor.textBackgroundColor))
+                statTile(
+                    value: hasPerformanceStats ? String(format: "%.0f", appState.averageTtft * 1000) : "-",
+                    unit: "ms",
+                    label: "Avg TTFT"
                 )
+                .frame(width: columnWidth, height: smallTileHeight)
             }
-        }
-        .padding(14)
-        .frame(width: 360, height: 380)
-    }
 
-    private func permissionsOk() -> Bool {
-        globalController.accessibilityEnabled
-            && globalController.inputMonitoringEnabled
-            && globalController.screenRecordingEnabled
-    }
+            // Row 2: OCR + tok/s
+            HStack(spacing: tileSpacing) {
+                tileView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "eye")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text("OCR")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        HStack {
+                            Text("Context")
+                                .font(.system(.body, design: .rounded).weight(.semibold))
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { appState.ocrContextEnabled },
+                                set: { appState.setOcrContextEnabled($0) }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .tint(.blue)
+                        }
+                    }
+                }
+                .frame(width: columnWidth, height: smallTileHeight)
 
-    private func permissionsStatusText() -> String {
-        if permissionsOk() {
-            return "OK"
-        }
-        var missing: [String] = []
-        if !globalController.accessibilityEnabled {
-            missing.append("Accessibility")
-        }
-        if !globalController.inputMonitoringEnabled {
-            missing.append("Input Monitoring")
-        }
-        if !globalController.screenRecordingEnabled {
-            missing.append("Screen Recording")
-        }
-        return "Missing: " + missing.joined(separator: ", ")
-    }
-
-    private func statsContent() -> some View {
-        let acceptancePercent = appState.suggestedWordsCount > 0
-            ? (Double(appState.acceptedWordsCount) / Double(appState.suggestedWordsCount)) * 100.0
-            : 0.0
-        return VStack(alignment: .leading, spacing: 4) {
-            if appState.metricsSamples > 0 {
-                Text("Avg TTFT \(String(format: "%.0f", appState.averageTtft * 1000)) ms  •  Avg \(String(format: "%.1f", appState.averageTokensPerSecond)) tok/s  •  Avg Cache \(String(format: "%.1f", appState.averageCachedTokensReused))")
-                    .font(.system(.body, design: .rounded))
-            } else {
-                Text(appState.isLoading ? "Loading…" : "No stats yet")
-                    .font(.system(.body, design: .rounded))
-                    .foregroundColor(.secondary)
+                statTile(
+                    value: hasPerformanceStats ? String(format: "%.1f", appState.averageTokensPerSecond) : "-",
+                    unit: "tok/s",
+                    label: "Avg Speed"
+                )
+                .frame(width: columnWidth, height: smallTileHeight)
             }
-            HStack {
-                Text("Acceptance \(String(format: "%.0f", acceptancePercent))%  •  Suggested \(appState.suggestedWordsCount) words  •  Accepted \(appState.acceptedWordsCount) words")
-                    .font(.system(.body, design: .rounded))
+
+            // Row 3: Acceptance + Suggested
+            HStack(spacing: tileSpacing) {
+                statTile(
+                    value: appState.suggestedWordsCount > 0
+                        ? String(format: "%.0f", (Double(appState.acceptedWordsCount) / Double(appState.suggestedWordsCount)) * 100)
+                        : "0",
+                    unit: "%",
+                    label: "Acceptance"
+                )
+                .frame(width: columnWidth, height: smallTileHeight)
+
+                statTileWithReset(
+                    value: formatNumber(appState.suggestedWordsCount),
+                    label: "Suggested",
+                    onReset: { appState.resetAcceptanceStats() }
+                )
+                .frame(width: columnWidth, height: smallTileHeight)
+            }
+
+            // Row 4: About you
+            tileView {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "text.bubble")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("About you")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Toggle(isOn: $isEditingPrompt) {
+                            Label("Edit", systemImage: "pencil.line")
+                        }
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                    }
+
+                    if isEditingPrompt {
+                        TextEditor(text: Binding(
+                            get: { appState.systemPrompt },
+                            set: { appState.setSystemPrompt($0) }
+                        ))
+                        .font(.system(.callout, design: .rounded))
+                        .frame(height: 80)
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(NSColor.textBackgroundColor))
+                        )
+                    } else {
+                        Text(promptPreview())
+                            .font(.system(.callout, design: .rounded))
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+            }
+            .frame(width: contentWidth)
+
+            // Row 5: Restrictions
+            tileView {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "hand.raised")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("Restrictions")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Toggle(isOn: $isEditingRestrictions) {
+                            Label("Edit", systemImage: "pencil.line")
+                        }
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                    }
+
+                    if isEditingRestrictions {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(appState.disabledApps) { app in
+                                HStack {
+                                    Text(app.name)
+                                        .font(.system(.callout, design: .rounded))
+                                    Spacer()
+                                    Button(action: {
+                                        appState.setAppDisabled(bundleId: app.id, name: nil, disabled: false)
+                                    }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+
+                            Menu {
+                                ForEach(runningApps.filter { app in
+                                    !appState.disabledApps.contains { $0.id == app.bundleId }
+                                }, id: \.bundleId) { app in
+                                    Button(app.name) {
+                                        appState.setAppDisabled(bundleId: app.bundleId, name: app.name, disabled: true)
+                                    }
+                                }
+                            } label: {
+                                Label("Add app", systemImage: "plus.circle")
+                                    .font(.system(.callout, design: .rounded))
+                            }
+                            .onAppear { refreshRunningApps() }
+                        }
+                        .frame(maxHeight: 100)
+                    } else {
+                        if appState.disabledApps.isEmpty {
+                            Text("No restrictions")
+                                .font(.system(.callout, design: .rounded))
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text(appState.disabledApps.map(\.name).joined(separator: ", "))
+                                .font(.system(.callout, design: .rounded))
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+            }
+            .frame(width: contentWidth)
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, horizontalPadding)
+        .frame(width: panelWidth)
+    }
+
+    private func refreshRunningApps() {
+        runningApps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+            .compactMap { app in
+                guard let bundleId = app.bundleIdentifier else { return nil }
+                let name = app.localizedName ?? bundleId
+                return (bundleId: bundleId, name: name)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func statTile(value: String, unit: String? = nil, label: String) -> some View {
+        tileView {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(label)
+                    .font(.system(.caption, design: .rounded))
                     .foregroundColor(.secondary)
                 Spacer()
-                Button(action: {
-                    appState.resetAcceptanceStats()
-                }) {
-                    Image(systemName: "arrow.counterclockwise")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 2) {
+                    Text(value)
+                        .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    if let unit = unit {
+                        Text(unit)
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundColor(.secondary)
+                    }
                 }
-                .buttonStyle(.plain)
-                .help("Reset acceptance statistics")
             }
         }
     }
 
-    private func sectionView<Content: View>(
-        title: String,
-        systemImage: String,
+    private func statTileWithReset(value: String, label: String, onReset: @escaping () -> Void) -> some View {
+        tileView {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(label)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button(action: onReset) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset statistics")
+                }
+                Spacer()
+                Text(value)
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+            }
+        }
+    }
+
+    private func headerView() -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Typofast")
+                    .font(.system(.title3, design: .rounded).weight(.semibold))
+                Text(appState.isLoading ? "Loading model..." : "Ready")
+                    .font(.system(.caption, design: .rounded))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Image(systemName: "text.cursor")
+                .font(.title2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var hasPerformanceStats: Bool {
+        appState.metricsSamples > 0
+            || appState.averageTtft > 0
+            || appState.averageTokensPerSecond > 0
+            || appState.averageCachedTokensReused > 0
+    }
+
+    private func promptPreview() -> String {
+        let trimmed = appState.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "No system prompt set"
+        }
+        return trimmed
+    }
+
+    private func formatNumber(_ num: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.groupingSeparator = " "
+        return formatter.string(from: NSNumber(value: num)) ?? "\(num)"
+    }
+
+    private func tileView<Content: View>(
+        backgroundColor: Color? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: systemImage)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text(title)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
             content()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(NSColor.controlBackgroundColor))
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(backgroundColor ?? Color.clear)
         )
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.ultraThinMaterial)
+        )
+        .shadow(color: Color.black.opacity(0.12), radius: 12, x: 0, y: 8)
+    }
+
+    private func statusTileColor() -> Color {
+        appState.isLoading ? Color(NSColor.systemOrange).opacity(0.35) : Color(NSColor.systemGreen).opacity(0.30)
     }
 }
 
 #Preview {
     let state = AppState()
-    ContentView(appState: state, globalController: GlobalSuggestionController(appState: state))
+    ContentView(appState: state)
         .frame(width: 800, height: 600)
 }

@@ -18,13 +18,6 @@ final class WindowContextExtractor {
 
         guard allowOCR else { return nil }
         guard let ocrCapture = await captureRegionImage(for: app, caretRegion: caretRegion, elementFrame: elementFrame) else { return nil }
-        #if DEBUG
-        if let exclusion = ocrCapture.exclusionRect {
-            print("[Typofast] ocr capture size=\(ocrCapture.image.width)x\(ocrCapture.image.height) exclusion=\(exclusion)")
-        } else {
-            print("[Typofast] ocr capture size=\(ocrCapture.image.width)x\(ocrCapture.image.height) exclusion=nil")
-        }
-        #endif
         let ocrText = recognizeText(
             in: ocrCapture.image,
             excluding: ocrCapture.exclusionRect,
@@ -65,22 +58,13 @@ final class WindowContextExtractor {
         let lines = observations.compactMap { observation -> OCRLine? in
             guard let candidate = observation.topCandidates(1).first else { return nil }
             if let exclusionRect, observationOverlapsExclusion(observation.boundingBox, image: image, exclusionRect: exclusionRect) {
-                #if DEBUG
-                print("[Typofast] ocr drop bbox overlap text=\"\(candidate.string)\"")
-                #endif
                 return nil
             }
             if let caretLineYInCrop, let caretBandHeight,
                observationInCaretBand(observation.boundingBox, image: image, caretLineYInCrop: caretLineYInCrop, caretBandHeight: caretBandHeight) {
-                #if DEBUG
-                print("[Typofast] ocr drop caret band text=\"\(candidate.string)\"")
-                #endif
                 return nil
             }
             if shouldExcludeText(candidate.string, excludeTextLine: excludeTextLine) {
-                #if DEBUG
-                print("[Typofast] ocr drop line match text=\"\(candidate.string)\"")
-                #endif
                 return nil
             }
             return OCRLine(text: candidate.string, confidence: candidate.confidence, bbox: observation.boundingBox)
@@ -157,7 +141,17 @@ final class WindowContextExtractor {
                 return nil
             }
 
-            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            let filter: SCContentFilter
+            if let display = displayForWindow(window, content: content) {
+                filter = SCContentFilter(
+                    display: display,
+                    excludingApplications: [],
+                    exceptingWindows: [window]
+                )
+            } else {
+                filter = SCContentFilter(desktopIndependentWindow: window)
+            }
             let configuration = SCStreamConfiguration()
             configuration.showsCursor = false
             configuration.capturesAudio = false
@@ -251,16 +245,6 @@ final class WindowContextExtractor {
                 scaleY: scaleY,
                 imageHeight: imageHeight
             )
-            #if DEBUG
-            if let elementFrameInWindow {
-                print("[Typofast] ocr elementFrameInWindow=\(elementFrameInWindow)")
-            } else {
-                print("[Typofast] ocr elementFrameInWindow=nil")
-            }
-            print("[Typofast] ocr caretRegion=\(caretRegion)")
-            print("[Typofast] ocr captureRegion=\(captureRegion)")
-            #endif
-
             return WindowCaptureResult(
                 image: croppedImage,
                 title: window.title,
@@ -335,6 +319,18 @@ final class WindowContextExtractor {
         } catch {
             return nil
         }
+    }
+
+    @available(macOS 14.0, *)
+    private func displayForWindow(_ window: SCWindow, content: SCShareableContent) -> SCDisplay? {
+        let windowFrame = window.frame
+        for display in content.displays {
+            let displayBounds = CGDisplayBounds(display.displayID)
+            if displayBounds.intersects(windowFrame) {
+                return display
+            }
+        }
+        return nil
     }
 
     private func trimFromEnd(_ text: String) -> String {
