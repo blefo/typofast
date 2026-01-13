@@ -43,6 +43,7 @@ final class GlobalSuggestionController: ObservableObject {
     private var lastOverlayText: String = ""
     private var lastOverlayCaret: CGPoint?
     private var lastOverlayFontKey: String = ""
+    private var lastAcceptTime: CFAbsoluteTime = 0
     private var lastWindowContextKey: String = ""
     private var windowContextTask: Task<Void, Never>?
     private var lastWindowContextCaptureTime: CFAbsoluteTime = 0
@@ -326,6 +327,9 @@ final class GlobalSuggestionController: ObservableObject {
             return
         }
 
+        if context.caretRect == nil {
+            appState.updateWindowContext(nil)
+        }
         focusedContext = context
 
         let normalizedValue = context.value.map { normalizeObservedValue($0) }
@@ -470,13 +474,26 @@ final class GlobalSuggestionController: ObservableObject {
             guard shouldCapture else { return }
 
             await self.logWindowContext("capture start app=\"\(appName)\" title=\"\(identity.title ?? "Unknown")\" trigger=\(trigger)")
-            let caretRegion = await MainActor.run { () -> CGRect? in
-                return self.focusedContext?.caretRect
+            let (caretRegion, elementFrame, excludeTextLine) = await MainActor.run { () -> (CGRect?, CGRect?, String?) in
+                let context = self.focusedContext
+                let line = context.flatMap { ctx in
+                    self.currentLineText(value: ctx.value, selection: ctx.selectedRange)
+                }
+                return (context?.caretRect, context?.elementFrame, line)
+            }
+            guard let caretRegion else {
+                await MainActor.run {
+                    self.appState.updateWindowContext(nil)
+                    self.logWindowContext("capture skipped no-caret app=\"\(appName)\" title=\"\(identity.title ?? "Unknown")\"")
+                }
+                return
             }
             let context = await self.windowContextExtractor.extract(
                 frontmostApp: frontmostApp,
                 allowOCR: await MainActor.run { self.appState.ocrContextEnabled },
-                caretRegion: caretRegion
+                caretRegion: caretRegion,
+                elementFrame: elementFrame,
+                excludeTextLine: excludeTextLine
             )
             await MainActor.run {
                 self.appState.updateWindowContext(context)
@@ -537,12 +554,36 @@ final class GlobalSuggestionController: ObservableObject {
             guard position.type == CursorType.textCaret else {
                 return nil
             }
-            lastCursorPoint = position.point
+            // CursorBounds returns Quartz coordinates (Y=0 at top)
+            // Convert to AppKit coordinates (Y=0 at bottom)
+            let quartzPoint = position.point
+            let appKitPoint = convertQuartzPointToAppKit(quartzPoint)
+            lastCursorPoint = appKitPoint
             lastCursorUpdateTime = CFAbsoluteTimeGetCurrent()
-            return position.point
+            return appKitPoint
         } catch {
             return nil
         }
+    }
+
+    private func convertQuartzPointToAppKit(_ quartzPoint: CGPoint) -> CGPoint {
+        // Find which screen contains this point
+        for screen in NSScreen.screens {
+            guard let displayId = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+                continue
+            }
+            let displayBounds = CGDisplayBounds(displayId)
+            if displayBounds.contains(quartzPoint) {
+                let appKitX = quartzPoint.x - displayBounds.origin.x + screen.frame.origin.x
+                let appKitY = (displayBounds.origin.y + displayBounds.height) - quartzPoint.y + screen.frame.origin.y
+                return CGPoint(x: appKitX, y: appKitY)
+            }
+        }
+        // Fallback: assume main screen and do simple flip
+        if let mainScreen = NSScreen.main {
+            return CGPoint(x: quartzPoint.x, y: mainScreen.frame.height - quartzPoint.y)
+        }
+        return quartzPoint
     }
 
     private func logSandboxStatus() {
@@ -564,11 +605,23 @@ final class GlobalSuggestionController: ObservableObject {
             lastOverlayFontKey = ""
             return
         }
-        let effectiveFont = focusedContext?.font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        // Use extracted font, or fallback to system font
+        let effectiveFont = focusedContext?.font ?? NSFont.systemFont(ofSize: 15)
         let fontKey = "\(effectiveFont.fontName)-\(effectiveFont.pointSize)"
 
-        guard let caretPoint = cursorPointWithGrace() else {
-            return
+        // During stabilization period after acceptance, use last known caret to prevent flickering
+        let timeSinceAccept = updateStart - lastAcceptTime
+        let isStabilizing = timeSinceAccept < 0.3 && lastOverlayCaret != nil
+
+        let caretPoint: CGPoint
+        if isStabilizing, let lastCaret = lastOverlayCaret {
+            // Use last known position during stabilization
+            caretPoint = lastCaret
+        } else {
+            guard let newCaretPoint = cursorPointWithGrace() else {
+                return
+            }
+            caretPoint = newCaretPoint
         }
 
         if suggestion == lastOverlayText,
@@ -652,46 +705,89 @@ final class GlobalSuggestionController: ObservableObject {
         let currentText = appState.currentText
         let newText = currentText + accepted
 
+        // Calculate new caret position for smooth overlay transition
+        let effectiveFont = focusedContext?.font ?? NSFont.systemFont(ofSize: 15)
+        let acceptedWidth = (accepted as NSString).size(withAttributes: [.font: effectiveFont]).width
+        if let currentCaret = lastOverlayCaret {
+            lastOverlayCaret = CGPoint(x: currentCaret.x + acceptedWidth, y: currentCaret.y)
+        }
+        lastAcceptTime = CFAbsoluteTimeGetCurrent()
+
         if let context = focusedContext {
-            // Set the entire text field value to ensure consistency
-            guard AXUIElementSetAttributeValue(context.element, kAXValueAttribute as CFString, newText as CFString) == .success else {
-                // Fallback to injection if we can't set the value
-                injectText(accepted)
+            // Get the current value before attempting insertion
+            let valueBefore = readValue(from: context.element) ?? ""
+            let expectedLength = (valueBefore as NSString).length + (accepted as NSString).length
+
+            // First try: insert at cursor using kAXSelectedTextAttribute
+            // This inserts text at current cursor position without replacing entire value
+            // and automatically moves cursor to end of inserted text
+            let insertResult = AXUIElementSetAttributeValue(
+                context.element,
+                kAXSelectedTextAttribute as CFString,
+                accepted as CFString
+            )
+
+            if insertResult == .success {
+                // Verify the text was actually inserted by checking length increased
+                let newValue = readValue(from: context.element)
+                if let newValue, (newValue as NSString).length >= expectedLength {
+                    // Insertion worked - cursor should already be at end of inserted text
+                    if let selectedRange = context.selectedRange {
+                        lastAcceptedRange = CFRange(location: selectedRange.location, length: (accepted as NSString).length)
+                    }
+                    lastAcceptedText = accepted
+                    suppressNextTextChange = newValue
+
+                    appState.applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: !acceptAll)
+
+                    focusedContext = FocusedTextContext(
+                        element: context.element,
+                        value: newValue,
+                        selectedRange: context.selectedRange.map { CFRange(location: $0.location + (accepted as NSString).length, length: 0) },
+                        caretRect: context.caretRect,
+                        elementFrame: context.elementFrame,
+                        font: context.font
+                    )
+                    updateOverlay()
+                    return true
+                }
+            }
+
+            // Second try: set entire text field value (for simple text fields that don't support selection insertion)
+            if AXUIElementSetAttributeValue(context.element, kAXValueAttribute as CFString, newText as CFString) == .success {
+                let acceptedLocation = (currentText as NSString).length
+                lastAcceptedRange = CFRange(location: acceptedLocation, length: (accepted as NSString).length)
                 lastAcceptedText = accepted
-                lastAcceptedRange = nil
+                suppressNextTextChange = newText
+
                 appState.applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: !acceptAll)
+
+                let newLocation = (newText as NSString).length
+
+                // Set cursor position after a brief delay to let the app settle
+                // This prevents cursor jumping in some apps while ensuring correct position in others
+                let element = context.element
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    var newRange = CFRange(location: newLocation, length: 0)
+                    if let axRange = AXValueCreate(.cfRange, &newRange) {
+                        AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange)
+                    }
+                }
+
+                focusedContext = FocusedTextContext(
+                    element: context.element,
+                    value: newText,
+                    selectedRange: CFRange(location: newLocation, length: 0),
+                    caretRect: context.caretRect,
+                    elementFrame: context.elementFrame,
+                    font: context.font
+                )
                 updateOverlay()
                 return true
             }
-
-            // Set cursor to end of new text
-            let newLocation = (newText as NSString).length
-            var newRange = CFRange(location: newLocation, length: 0)
-            if let axRange = AXValueCreate(.cfRange, &newRange) {
-                AXUIElementSetAttributeValue(context.element, kAXSelectedTextRangeAttribute as CFString, axRange)
-            }
-
-            // Track the accepted range for potential delete-undo
-            let acceptedLocation = (currentText as NSString).length
-            lastAcceptedRange = CFRange(location: acceptedLocation, length: (accepted as NSString).length)
-            lastAcceptedText = accepted
-            suppressNextTextChange = newText
-
-            appState.applyAcceptedSuggestion(accepted: accepted, newText: newText, keepRemaining: !acceptAll)
-
-            focusedContext = FocusedTextContext(
-                element: context.element,
-                value: newText,
-                selectedRange: CFRange(location: newLocation, length: 0),
-                caretRect: context.caretRect,
-                elementFrame: context.elementFrame,
-                font: context.font
-            )
-            updateOverlay()
-            return true
         }
 
-        // Fallback: inject typed characters when we cannot access AX element.
+        // Fallback: inject typed characters using keyboard simulation
         injectText(accepted)
         keyBuffer = newText
         lastAcceptedText = accepted
@@ -1371,6 +1467,32 @@ final class GlobalSuggestionController: ObservableObject {
         #if DEBUG
         print("[Typofast] context \(message)")
         #endif
+    }
+
+    private func currentLineText(value: String?, selection: CFRange?) -> String? {
+        guard let value, let selection else { return nil }
+        let nsValue = value as NSString
+        let length = nsValue.length
+        guard length > 0 else { return nil }
+        let location = max(0, min(selection.location, length))
+
+        let beforeRange = NSRange(location: 0, length: location)
+        let lastNewlineRange = nsValue.rangeOfCharacter(from: .newlines, options: .backwards, range: beforeRange)
+        let lineStart = lastNewlineRange.location == NSNotFound
+            ? 0
+            : min(length, lastNewlineRange.location + lastNewlineRange.length)
+
+        let afterRange = NSRange(location: location, length: max(0, length - location))
+        let nextNewlineRange = nsValue.rangeOfCharacter(from: .newlines, options: [], range: afterRange)
+        let lineEnd = nextNewlineRange.location == NSNotFound
+            ? length
+            : max(0, nextNewlineRange.location)
+
+        guard lineEnd >= lineStart else { return nil }
+        let line = nsValue.substring(with: NSRange(location: lineStart, length: lineEnd - lineStart))
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
     }
 }
 

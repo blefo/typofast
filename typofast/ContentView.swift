@@ -50,6 +50,7 @@ class AppState: ObservableObject {
     @Published var suggestedWordsCount: Int = 0
     @Published var acceptedWordsCount: Int = 0
     @Published var ocrContextEnabled: Bool = true
+    @Published var systemPrompt: String = ""
 
     private var inferenceTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
@@ -58,6 +59,7 @@ class AppState: ObservableObject {
     private var lastAppliedSuggestion = ""
     private var lastEmptyCompletionInput: String?
     private var inFlightRequestId: UUID?
+    private var textChangeCounter: Int64 = 0
     private var suggestionAnchor = ""
     private var suppressNextInference = false
     /// Atomic counter that can be safely incremented from any thread (event tap callback)
@@ -69,13 +71,19 @@ class AppState: ObservableObject {
     private let suggestedWordsKey = "typofast.suggestedWordsCount"
     private let acceptedWordsKey = "typofast.acceptedWordsCount"
     private let ocrContextEnabledKey = "typofast.ocrContextEnabled"
+    private let systemPromptKey = "typofast.systemPrompt"
     private let defaultModelPath = "/Users/baptistelefort/Downloads/Qwen3-1.7B-Base.i1-Q4_K_M.gguf"
+    private let defaultSystemPrompt = """
+        User context: My name is Baptiste Lefort. I usually write in English and French.
+        Write causally with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
+        """
     private let debounceDelayNs: UInt64 = 0_000_000
 
     init() {
         loadAcceptanceStats()
         loadDisabledApps()
         loadOcrContextEnabled()
+        loadSystemPrompt()
         loadDefaultModelIfNeeded()
         metricsObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("TypofastMetricsUpdate"),
@@ -165,6 +173,13 @@ class AppState: ObservableObject {
         UserDefaults.standard.set(acceptedWordsCount, forKey: acceptedWordsKey)
     }
 
+    func resetAcceptanceStats() {
+        suggestedWordsCount = 0
+        acceptedWordsCount = 0
+        UserDefaults.standard.removeObject(forKey: suggestedWordsKey)
+        UserDefaults.standard.removeObject(forKey: acceptedWordsKey)
+    }
+
     private func wordCount(in text: String) -> Int {
         let parts = text.split { $0.isWhitespace || $0.isNewline }
         return parts.count
@@ -209,6 +224,7 @@ class AppState: ObservableObject {
         if newText == lastText {
             return
         }
+        textChangeCounter += 1
         let previousText = lastText
         logEvent("textChange", [
             "prev": previousText,
@@ -344,19 +360,18 @@ class AppState: ObservableObject {
         // If any key is pressed during the request, this counter will change
         // This is atomic and can be updated from the event tap thread synchronously
         let startKeyCount = keyPressCounter.value
+        let startChangeCounter = textChangeCounter
 
-        let systemPrompt = """
-        User context: My name is Baptiste Lefort. I usually write in English and French.
-        Write causally with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
-        """
         let trimmedText = trimTrailingSpaces(text)
-        var promptParts: [String] = [systemPrompt]
-        if let context = windowContext, !context.text.isEmpty {
-            promptParts.append(context.promptBlock(maxTextLength: 1200))
+        var promptParts: [String] = [systemPrompt.isEmpty ? defaultSystemPrompt : systemPrompt]
+        if let context = windowContext,
+           let filteredContext = filteredWindowContext(context, inputText: trimmedText),
+           !filteredContext.text.isEmpty {
+            promptParts.append(filteredContext.promptBlock(maxTextLength: 1200))
             logEvent("contextUsed", [
-                "source": context.source.rawValue,
-                "len": "\(context.text.count)",
-                "title": context.windowTitle ?? ""
+                "source": filteredContext.source.rawValue,
+                "len": "\(filteredContext.text.count)",
+                "title": filteredContext.windowTitle ?? ""
             ])
         }
         promptParts.append(trimmedText)
@@ -383,6 +398,18 @@ class AppState: ObservableObject {
         guard currentKeyCount == startKeyCount else {
             #if DEBUG
             print("[Typofast] discarding completion: keyCount changed from \(startKeyCount) to \(currentKeyCount)")
+            #endif
+            return
+        }
+        guard textChangeCounter == startChangeCounter else {
+            #if DEBUG
+            print("[Typofast] discarding completion: text changed during request")
+            #endif
+            return
+        }
+        guard currentText == text else {
+            #if DEBUG
+            print("[Typofast] discarding completion: currentText drifted from request text")
             #endif
             return
         }
@@ -416,6 +443,74 @@ class AppState: ObservableObject {
             "suggestionLength": "\(completion.count)"
         ])
         applyMetrics(completionMetrics)
+    }
+
+    private func filteredWindowContext(_ context: WindowTextContext, inputText: String) -> WindowTextContext? {
+        let maxAge: TimeInterval = context.source == .ocr ? 1.0 : 3.0
+        guard context.isFresh(maxAge: maxAge) else { return nil }
+        guard context.source == .ocr else { return context }
+
+        let normalizedInputLines = normalizeLines(inputText)
+        if normalizedInputLines.isEmpty {
+            return context
+        }
+
+        let filteredLines = context.text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { line in
+                let normalizedLine = normalizeLine(String(line))
+                guard !normalizedLine.isEmpty else { return false }
+                return !normalizedInputLines.contains { inputLine in
+                    shouldExcludeLine(normalizedLine, inputLine: inputLine)
+                }
+            }
+
+        let filteredText = filteredLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !filteredText.isEmpty else { return nil }
+
+        return WindowTextContext(
+            appName: context.appName,
+            bundleId: context.bundleId,
+            windowTitle: context.windowTitle,
+            source: context.source,
+            text: filteredText,
+            capturedAt: context.capturedAt
+        )
+    }
+
+    private func normalizeLines(_ text: String) -> [String] {
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        let normalized = lines.map(normalizeLine).filter { !$0.isEmpty }
+        return Array(Set(normalized))
+    }
+
+    private func normalizeLine(_ text: String) -> String {
+        let transformed = text.applyingTransform(.toLatin, reverse: false) ?? text
+        let folded = transformed.folding(options: [.diacriticInsensitive, .widthInsensitive], locale: .current)
+        let lowered = folded.lowercased()
+        let filtered = lowered.unicodeScalars.map { scalar -> Character in
+            if CharacterSet.alphanumerics.contains(scalar) {
+                return Character(scalar)
+            }
+            return " "
+        }
+        let collapsed = String(filtered).replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func shouldExcludeLine(_ normalizedLine: String, inputLine: String) -> Bool {
+        guard normalizedLine.count >= 6, inputLine.count >= 6 else { return false }
+        if inputLine.contains(normalizedLine) || normalizedLine.contains(inputLine) {
+            return true
+        }
+        let prefixLength = min(24, inputLine.count)
+        if prefixLength >= 8 {
+            let prefix = String(inputLine.prefix(prefixLength))
+            if normalizedLine.contains(prefix) {
+                return true
+            }
+        }
+        return false
     }
 
     func acceptSuggestion() -> String {
@@ -530,7 +625,17 @@ class AppState: ObservableObject {
         }
 
         let consumed = String(newText.dropFirst(suggestionAnchor.count))
-        guard suggestionBase.hasPrefix(consumed) else {
+        let remainingBase = String(suggestionBase.dropFirst(suggestionOffset))
+        guard remainingBase.hasPrefix(consumed) else {
+            #if DEBUG
+            logEvent("keepSuggestion.mismatch", [
+                "anchor": suggestionAnchor,
+                "base": suggestionBase,
+                "offset": "\(suggestionOffset)",
+                "remainingBase": remainingBase,
+                "typed": consumed
+            ])
+            #endif
             suggestion = ""
             suggestionBase = ""
             suggestionOffset = 0
@@ -539,12 +644,14 @@ class AppState: ObservableObject {
             return false
         }
 
-        suggestionOffset = consumed.count
+        suggestionOffset += consumed.count
         suggestion = String(suggestionBase.dropFirst(suggestionOffset))
         currentText = newText
+        suggestionAnchor = newText
         logEvent("keepSuggestion.matching", [
             "typed": consumed,
-            "remaining": suggestion
+            "remaining": suggestion,
+            "offset": "\(suggestionOffset)"
         ])
         return true
     }
@@ -554,7 +661,8 @@ class AppState: ObservableObject {
         guard !suggestionAnchor.isEmpty else { return false }
         guard newText.hasPrefix(suggestionAnchor) else { return false }
         let consumed = String(newText.dropFirst(suggestionAnchor.count))
-        return suggestionBase.hasPrefix(consumed)
+        let remainingBase = String(suggestionBase.dropFirst(suggestionOffset))
+        return remainingBase.hasPrefix(consumed)
     }
 
     private func logEvent(_ name: String, _ data: [String: String]) {
@@ -629,6 +737,19 @@ class AppState: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: ocrContextEnabledKey)
     }
 
+    private func loadSystemPrompt() {
+        if let saved = UserDefaults.standard.string(forKey: systemPromptKey), !saved.isEmpty {
+            systemPrompt = saved
+        } else {
+            systemPrompt = defaultSystemPrompt
+        }
+    }
+
+    func setSystemPrompt(_ prompt: String) {
+        systemPrompt = prompt
+        UserDefaults.standard.set(prompt, forKey: systemPromptKey)
+    }
+
     var modelDisplayName: String {
         URL(fileURLWithPath: modelPath ?? defaultModelPath).lastPathComponent
     }
@@ -677,9 +798,24 @@ struct ContentView: View {
                 ))
                 .font(.system(.body, design: .rounded))
             }
+
+            sectionView(title: "System Prompt", systemImage: "text.bubble") {
+                TextEditor(text: Binding(
+                    get: { appState.systemPrompt },
+                    set: { appState.setSystemPrompt($0) }
+                ))
+                .font(.system(.body, design: .rounded))
+                .frame(height: 80)
+                .scrollContentBackground(.hidden)
+                .padding(4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color(NSColor.textBackgroundColor))
+                )
+            }
         }
         .padding(14)
-        .frame(width: 360, height: 280)
+        .frame(width: 360, height: 380)
     }
 
     private func permissionsOk() -> Bool {
@@ -718,9 +854,21 @@ struct ContentView: View {
                     .font(.system(.body, design: .rounded))
                     .foregroundColor(.secondary)
             }
-            Text("Acceptance \(String(format: "%.0f", acceptancePercent))%  •  Suggested \(appState.suggestedWordsCount) words  •  Accepted \(appState.acceptedWordsCount) words")
-                .font(.system(.body, design: .rounded))
-                .foregroundColor(.secondary)
+            HStack {
+                Text("Acceptance \(String(format: "%.0f", acceptancePercent))%  •  Suggested \(appState.suggestedWordsCount) words  •  Accepted \(appState.acceptedWordsCount) words")
+                    .font(.system(.body, design: .rounded))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button(action: {
+                    appState.resetAcceptanceStats()
+                }) {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Reset acceptance statistics")
+            }
         }
     }
 

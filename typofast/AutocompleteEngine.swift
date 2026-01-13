@@ -14,6 +14,7 @@ struct CompletionMetrics {
 
 private struct SamplingConfig {
     var maxSuggestTokens: Int = 14
+    var minSuggestTokens: Int = 6
     var temperature: Float = 0.15
     var topK: Int32 = 20
     var topP: Float = 0.9
@@ -303,9 +304,9 @@ actor AutocompleteEngine {
         }
         if tokenText.contains("\n") { return generatedCount > 0 }
         if tokenText == "</s>" { return true }
-        if tokenText.contains(".") || tokenText.contains("!") || tokenText.contains("?") {
-            return generatedCount > 0
-        }
+        //if tokenText.contains(".") || tokenText.contains("!") || tokenText.contains("?") {
+        //    return generatedCount > 0
+        //}
         return false
     }
 }

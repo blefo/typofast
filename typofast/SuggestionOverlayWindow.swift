@@ -1,19 +1,40 @@
 import AppKit
+import CoreText
+
+/// Custom view for rendering suggestion text with pixel-perfect positioning
+private final class SuggestionTextView: NSView {
+    var text: String = ""
+    var textFont: NSFont = NSFont.systemFont(ofSize: 14)
+    var textColor: NSColor = .systemGray
+
+    override var isFlipped: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !text.isEmpty else { return }
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: textFont,
+            .foregroundColor: textColor
+        ]
+
+        // In a non-flipped NSView, Y=0 is at the bottom
+        // draw(at:) places the string's bounding box origin at the point
+        // The descender extends below the baseline, so the bounding box bottom
+        // is at baseline + descender (where descender is negative)
+        //
+        // To align our text baseline with the window bottom, we draw at Y=0
+        // The text's bounding box bottom will be at Y=0, and baseline will be
+        // at Y = -descender (positive value, e.g., 3pt above bottom)
+        (text as NSString).draw(at: NSPoint(x: 0, y: 0), withAttributes: attributes)
+    }
+}
 
 final class SuggestionOverlayWindow: NSPanel {
-    private let label: NSTextField
+    private let textView: SuggestionTextView
 
     init() {
-        label = NSTextField(labelWithString: "")
-        label.alignment = .left
-        label.lineBreakMode = .byClipping
-        label.maximumNumberOfLines = 1
-        label.backgroundColor = .clear
-        label.textColor = .systemGray
-        label.drawsBackground = false
-        label.isBordered = false
-        label.isEditable = false
-        label.isSelectable = false
+        textView = SuggestionTextView()
+        textView.wantsLayer = true
 
         super.init(
             contentRect: .zero,
@@ -32,57 +53,70 @@ final class SuggestionOverlayWindow: NSPanel {
         isReleasedWhenClosed = false
 
         let contentView = NSView(frame: .zero)
-        contentView.addSubview(label)
+        contentView.addSubview(textView)
         self.contentView = contentView
     }
 
+    /// Update the overlay with suggestion text
+    /// - Parameters:
+    ///   - text: The suggestion text to display
+    ///   - font: The font to match the target text
+    ///   - color: The text color
+    ///   - origin: The position where text should start (bottom-right of caret in AppKit coords)
     func update(text: String, font: NSFont, color: NSColor, origin: CGPoint) {
         guard !text.isEmpty else {
             orderOut(nil)
             return
         }
 
-        label.stringValue = text
-        label.font = font
-        label.textColor = color.withAlphaComponent(1.0)
+        textView.text = text
+        textView.textFont = font
+        textView.textColor = color.withAlphaComponent(1.0)
 
         let attributes: [NSAttributedString.Key: Any] = [.font: font]
         let textSize = (text as NSString).size(withAttributes: attributes)
-        let padX: CGFloat = 4
-        let padY: CGFloat = 4
-        let width = ceil(textSize.width) + padX * 2
-        let height = ceil(textSize.height) + padY * 2
 
-        // origin is the bottom-left corner where the suggestion should appear
+        // Calculate window size - exact fit, no padding
+        let width = ceil(textSize.width)
+        let height = ceil(textSize.height)
+
+        // origin is the bottom-right of the caret rect in AppKit coordinates
+        // We position the window bottom at the caret bottom to align text baselines
+        //
+        // In AppKit coordinates (origin at bottom-left of screen):
+        // - origin.y is the bottom of the caret/text line
+        // - Higher Y = further up on screen
+        //
+        // By aligning window bottom with caret bottom, and using the same font,
+        // the baselines should align naturally since both texts have the same
+        // distance from their bounding box bottom to baseline.
+
         let windowFrame = CGRect(x: origin.x, y: origin.y, width: width, height: height)
 
-        #if DEBUG
-        //print("[Typofast] SuggestionOverlay: setting frame=\(windowFrame) text=\"\(text.prefix(20))...\"")
-        #endif
-
-        let point = origin
-        let screen = NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main
+        // Clamp to visible screen area
+        let screen = NSScreen.screens.first { $0.frame.contains(origin) } ?? NSScreen.main
+        var finalFrame = windowFrame
         if let visibleFrame = screen?.visibleFrame {
-            var clamped = windowFrame
-            if clamped.maxX > visibleFrame.maxX { clamped.origin.x = visibleFrame.maxX - clamped.width }
-            if clamped.minX < visibleFrame.minX { clamped.origin.x = visibleFrame.minX }
-            if clamped.maxY > visibleFrame.maxY { clamped.origin.y = visibleFrame.maxY - clamped.height }
-            if clamped.minY < visibleFrame.minY { clamped.origin.y = visibleFrame.minY }
-            setFrame(clamped, display: true)
-        } else {
-            setFrame(windowFrame, display: true)
+            if finalFrame.maxX > visibleFrame.maxX {
+                finalFrame.origin.x = visibleFrame.maxX - finalFrame.width
+            }
+            if finalFrame.minX < visibleFrame.minX {
+                finalFrame.origin.x = visibleFrame.minX
+            }
+            if finalFrame.maxY > visibleFrame.maxY {
+                finalFrame.origin.y = visibleFrame.maxY - finalFrame.height
+            }
+            if finalFrame.minY < visibleFrame.minY {
+                finalFrame.origin.y = visibleFrame.minY
+            }
         }
-        contentView?.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
-        label.frame = CGRect(x: padX, y: padY, width: width - padX * 2, height: height - padY * 2)
+
+        setFrame(finalFrame, display: true)
+        contentView?.frame = CGRect(origin: .zero, size: finalFrame.size)
+        textView.frame = CGRect(origin: .zero, size: finalFrame.size)
+        textView.needsDisplay = true
 
         orderFrontRegardless()
-
-        #if DEBUG
-        let wf = frame
-        let screens = NSScreen.screens.map { $0.frame }
-        let onAnyScreen = NSScreen.screens.contains { $0.frame.intersects(wf) }
-        //print("[Typofast] Overlay state visible=\(isVisible) alpha=\(alphaValue) level=\(level.rawValue) frame=\(wf) onAnyScreen=\(onAnyScreen) screens=\(screens)")
-        #endif
     }
 
     func hide() {
