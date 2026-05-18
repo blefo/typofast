@@ -108,6 +108,7 @@ actor AutocompleteEngine {
     }
 
     func getCompletion(prompt: String, inputText: String, maxTokens: Int = 10) async -> (String, CompletionMetrics) {
+        guard !Task.isCancelled else { return ("", CompletionMetrics()) }
         generationId += 1
         let myGenerationId = generationId
         return getCompletionSync(
@@ -130,6 +131,8 @@ actor AutocompleteEngine {
         var metrics = CompletionMetrics()
         var ttft: Double? = nil
 
+        guard !Task.isCancelled else { return ("", metrics) }
+
         let tokens = llama.tokenize(text: prompt, addBos: true)
         guard !tokens.isEmpty else { return ("", metrics) }
 
@@ -137,7 +140,19 @@ actor AutocompleteEngine {
         metrics.cachedTokensReused = commonPrefix
 
         if commonPrefix < promptTokens.count {
-            _ = llama.clearSequence(seqId: promptSeqId, from: Int32(commonPrefix))
+            guard llama.clearSequence(seqId: promptSeqId, from: Int32(commonPrefix)) else {
+                hardResetCache()
+                if allowRetry {
+                    return getCompletionSync(
+                        prompt: prompt,
+                        inputText: inputText,
+                        maxTokens: maxTokens,
+                        generationId: generationId,
+                        allowRetry: false
+                    )
+                }
+                return ("", metrics)
+            }
             promptTokens = Array(promptTokens.prefix(commonPrefix))
         }
 
@@ -166,12 +181,16 @@ actor AutocompleteEngine {
                 return ("", metrics)
             }
         }
+        if Task.isCancelled {
+            hardResetCache()
+            return ("", metrics)
+        }
         metrics.promptProcessingTime = Date().timeIntervalSince(promptStart)
         metrics.promptTokensProcessed = tokens.count - commonPrefix
 
         promptTokens = tokens
 
-        guard generationId == self.generationId else {
+        guard generationId == self.generationId, !Task.isCancelled else {
             return ("", metrics)
         }
 
@@ -193,7 +212,7 @@ actor AutocompleteEngine {
         }
 
         for _ in 0..<maxOut {
-            if generationId != self.generationId {
+            if generationId != self.generationId || Task.isCancelled {
                 _ = llama.clearSequence(seqId: genSeqId, from: 0)
                 return ("", metrics)
             }
@@ -298,11 +317,12 @@ actor AutocompleteEngine {
 
     private func shouldStop(tokenText: String, generatedCount: Int) -> Bool {
         if tokenText.isEmpty { return false }
+        if tokenText.contains("\n") || tokenText.contains("\r") { return true }
+        if tokenText.contains("<|") { return true }
         if generatedCount == 0,
            tokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return false
         }
-        if tokenText.contains("\n") { return generatedCount > 0 }
         if tokenText == "</s>" { return true }
         //if tokenText.contains(".") || tokenText.contains("!") || tokenText.contains("?") {
         //    return generatedCount > 0

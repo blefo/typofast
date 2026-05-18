@@ -92,12 +92,11 @@ final class LlamaContext {
     func tokenize(text: String, addBos: Bool) -> [Int32] {
         guard let vocab = vocab else { return [] }
 
-        let maxTokens = 512
+        var maxTokens = max(512, text.utf8.count / 2)
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: maxTokens)
-        defer { tokens.deallocate() }
 
         let textBytes = text.utf8CString
-        let nTokens = textBytes.withUnsafeBufferPointer { buffer in
+        var nTokens = textBytes.withUnsafeBufferPointer { buffer in
             llama_tokenize(
                 vocab,
                 buffer.baseAddress,
@@ -109,7 +108,35 @@ final class LlamaContext {
             )
         }
 
-        guard nTokens >= 0 else { return [] }
+        if nTokens < 0 {
+            tokens.deallocate()
+            maxTokens = Int(-nTokens)
+            let resizedTokens = UnsafeMutablePointer<llama_token>.allocate(capacity: maxTokens)
+            defer { resizedTokens.deallocate() }
+
+            nTokens = textBytes.withUnsafeBufferPointer { buffer in
+                llama_tokenize(
+                    vocab,
+                    buffer.baseAddress,
+                    Int32(buffer.count - 1),
+                    resizedTokens,
+                    Int32(maxTokens),
+                    addBos,
+                    false
+                )
+            }
+
+            guard nTokens >= 0 else { return [] }
+
+            var result: [Int32] = []
+            result.reserveCapacity(Int(nTokens))
+            for i in 0..<Int(nTokens) {
+                result.append(resizedTokens[i])
+            }
+            return result
+        }
+
+        defer { tokens.deallocate() }
 
         var result: [Int32] = []
         result.reserveCapacity(Int(nTokens))

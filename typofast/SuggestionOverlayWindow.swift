@@ -7,7 +7,8 @@ private final class SuggestionTextView: NSView {
     var textFont: NSFont = NSFont.systemFont(ofSize: 14)
     var textColor: NSColor = .systemGray
 
-    override var isFlipped: Bool { false }
+    // Use top-left coordinates so draw(at:) is intuitive and fully visible.
+    override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
         guard !text.isEmpty else { return }
@@ -17,14 +18,6 @@ private final class SuggestionTextView: NSView {
             .foregroundColor: textColor
         ]
 
-        // In a non-flipped NSView, Y=0 is at the bottom
-        // draw(at:) places the string's bounding box origin at the point
-        // The descender extends below the baseline, so the bounding box bottom
-        // is at baseline + descender (where descender is negative)
-        //
-        // To align our text baseline with the window bottom, we draw at Y=0
-        // The text's bounding box bottom will be at Y=0, and baseline will be
-        // at Y = -descender (positive value, e.g., 3pt above bottom)
         (text as NSString).draw(at: NSPoint(x: 0, y: 0), withAttributes: attributes)
     }
 }
@@ -54,6 +47,7 @@ final class SuggestionOverlayWindow: NSPanel {
 
         let contentView = NSView(frame: .zero)
         contentView.addSubview(textView)
+        textView.autoresizingMask = [.width, .height]
         self.contentView = contentView
     }
 
@@ -80,16 +74,8 @@ final class SuggestionOverlayWindow: NSPanel {
         let width = ceil(textSize.width)
         let height = ceil(textSize.height)
 
-        // origin is the bottom-right of the caret rect in AppKit coordinates
-        // We position the window bottom at the caret bottom to align text baselines
-        //
-        // In AppKit coordinates (origin at bottom-left of screen):
-        // - origin.y is the bottom of the caret/text line
-        // - Higher Y = further up on screen
-        //
-        // By aligning window bottom with caret bottom, and using the same font,
-        // the baselines should align naturally since both texts have the same
-        // distance from their bounding box bottom to baseline.
+        // origin is the bottom-right of the caret rect in AppKit coordinates.
+        // Keep the overlay origin directly at caret X and line bottom Y.
 
         let windowFrame = CGRect(x: origin.x, y: origin.y, width: width, height: height)
 
@@ -111,8 +97,8 @@ final class SuggestionOverlayWindow: NSPanel {
             }
         }
 
-        setFrame(finalFrame, display: true)
-        contentView?.frame = CGRect(origin: .zero, size: finalFrame.size)
+        // Avoid forcing synchronous layout while other views may be laying out.
+        setFrame(finalFrame, display: false)
         textView.frame = CGRect(origin: .zero, size: finalFrame.size)
         textView.needsDisplay = true
 

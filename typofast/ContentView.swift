@@ -62,6 +62,7 @@ class AppState: ObservableObject {
     private var textChangeCounter: Int64 = 0
     private var suggestionAnchor = ""
     private var suppressNextInference = false
+    private var hasLoggedMissingEngine = false
     /// Atomic counter that can be safely incremented from any thread (event tap callback)
     /// and read from MainActor without race conditions
     let keyPressCounter = AtomicKeyPressCounter()
@@ -76,12 +77,14 @@ class AppState: ObservableObject {
     private let metricsSamplesKey = "typofast.metricsSamples"
     private let ocrContextEnabledKey = "typofast.ocrContextEnabled"
     private let systemPromptKey = "typofast.systemPrompt"
-    private let defaultModelPath = "/Users/baptistelefort/Downloads/Qwen3-1.7B-Base.i1-Q4_K_M.gguf"
+    private let managedModelRepository = "unsloth/gemma-4-E2B-it-GGUF"
+    private let managedModelFilename = "gemma-4-E2B-it-Q4_K_M.gguf"
+    private let managedModelRemoteURL = URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf?download=true")!
     private let defaultSystemPrompt = """
         User context: My name is Baptiste Lefort. I usually write in English and French.
         Write causally with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
         """
-    private let debounceDelayNs: UInt64 = 0_000_000
+    private let debounceDelayNs: UInt64 = 120_000_000
 
     init() {
         loadAcceptanceStats()
@@ -89,7 +92,7 @@ class AppState: ObservableObject {
         loadDisabledApps()
         loadOcrContextEnabled()
         loadSystemPrompt()
-        loadDefaultModelIfNeeded()
+        loadInitialModelIfNeeded()
         metricsObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("TypofastMetricsUpdate"),
             object: nil,
@@ -232,12 +235,16 @@ class AppState: ObservableObject {
             try await engine.loadModel(path: path)
             self.engine = engine
             self.modelPath = path
-            UserDefaults.standard.set(path, forKey: "typofast.modelPath")
             loadingStatus = "Model loaded successfully!"
+            hasLoggedMissingEngine = false
+            #if DEBUG
+            print("[Typofast] model loaded path=\"\(path)\"")
+            #endif
 
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             isLoading = false
         } catch {
+            self.engine = nil
             loadingStatus = "Error loading model: \(error.localizedDescription)"
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             isLoading = false
@@ -261,6 +268,16 @@ class AppState: ObservableObject {
             lastEmptyCompletionInput = nil
         }
         let changeStart = CFAbsoluteTimeGetCurrent()
+        guard engine != nil else {
+            isGenerating = false
+            #if DEBUG
+            if !hasLoggedMissingEngine {
+                hasLoggedMissingEngine = true
+                print("[Typofast] completion skipped: no model loaded")
+            }
+            #endif
+            return
+        }
         if !suggestionBase.isEmpty,
            !suggestionAnchor.isEmpty,
            !newText.hasPrefix(suggestionAnchor),
@@ -387,19 +404,18 @@ class AppState: ObservableObject {
         let startChangeCounter = textChangeCounter
 
         let trimmedText = trimTrailingSpaces(text)
-        var promptParts: [String] = [systemPrompt.isEmpty ? defaultSystemPrompt : systemPrompt]
+        var contextBlock = ""
         if let context = windowContext,
            let filteredContext = filteredWindowContext(context, inputText: trimmedText),
            !filteredContext.text.isEmpty {
-            promptParts.append(filteredContext.promptBlock(maxTextLength: 1200))
+            contextBlock = filteredContext.promptBlock(maxTextLength: 1200)
             logEvent("contextUsed", [
                 "source": filteredContext.source.rawValue,
                 "len": "\(filteredContext.text.count)",
                 "title": filteredContext.windowTitle ?? ""
             ])
         }
-        promptParts.append(trimmedText)
-        let modelPrompt = promptParts.joined(separator: "\n\n")
+        let modelPrompt = buildCompletionPrompt(text: text, contextBlock: contextBlock)
         logEvent("requestCompletion", [
             "text": text,
             "modelPrompt": modelPrompt
@@ -408,7 +424,7 @@ class AppState: ObservableObject {
         let (completion, completionMetrics) = await engine.getCompletion(
             prompt: modelPrompt,
             inputText: text,
-            maxTokens: 6
+            maxTokens: 10
         )
 
         // Check if this request was cancelled while waiting
@@ -446,27 +462,129 @@ class AppState: ObservableObject {
             "ttft": String(format: "%.2f", completionMetrics.ttft * 1000.0)
         ])
 
-        lastAppliedSuggestion = completion
-        if completion.isEmpty {
+        let sanitizedCompletion = sanitizeCompletion(completion, inputText: text)
+        lastAppliedSuggestion = sanitizedCompletion
+        if sanitizedCompletion.isEmpty {
             lastEmptyCompletionInput = text
         } else {
             lastEmptyCompletionInput = nil
         }
-        suggestionBase = completion
+        suggestionBase = sanitizedCompletion
         suggestionOffset = 0
-        suggestion = completion
+        suggestion = sanitizedCompletion
         suggestionAnchor = text
-        if !completion.isEmpty {
-            addSuggestedWords(from: completion)
+        if !sanitizedCompletion.isEmpty {
+            addSuggestedWords(from: sanitizedCompletion)
         }
         logEvent("completionReceived", [
             "raw": completion,
-            "sanitized": completion
+            "sanitized": sanitizedCompletion
         ])
         logEvent("timing.suggestionApplied", [
-            "suggestionLength": "\(completion.count)"
+            "suggestionLength": "\(sanitizedCompletion.count)"
         ])
         applyMetrics(completionMetrics)
+    }
+
+    private func buildCompletionPrompt(text: String, contextBlock: String) -> String {
+        let stylePrompt = (systemPrompt.isEmpty ? defaultSystemPrompt : systemPrompt)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let inlineInput = currentInlineInput(from: text)
+        var prompt = "\(stylePrompt)\n\n"
+        if !contextBlock.isEmpty {
+            prompt += "\(contextBlock)\n\n"
+        }
+        prompt += inlineInput
+        return prompt
+    }
+
+    private func sanitizeCompletion(_ raw: String, inputText: String) -> String {
+        guard !raw.isEmpty else { return "" }
+
+        let hadLeadingWhitespace = raw.first?.isWhitespace == true
+        var cleaned = raw
+            .replacingOccurrences(of: "\\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+
+        cleaned = String(cleaned.unicodeScalars.filter { scalar in
+            !CharacterSet.controlCharacters.contains(scalar)
+        })
+
+        cleaned = cleaned.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`.,;:!?()[]{}<>/\\"))
+        guard !cleaned.isEmpty else { return "" }
+
+        let inputLine = trimTrailingSpaces(currentInlineInput(from: inputText))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !inputLine.isEmpty {
+            if cleaned == inputLine {
+                return ""
+            }
+            if cleaned.hasPrefix(inputLine + " ") {
+                cleaned = String(cleaned.dropFirst(inputLine.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`.,;:!?()[]{}<>/\\"))
+                guard !cleaned.isEmpty else { return "" }
+            }
+        }
+
+        let lowered = cleaned.lowercased()
+        let blockedPrefixes = [
+            "assistant:",
+            "user:",
+            "system:",
+            "okay, so",
+            "here is",
+            "here's",
+            "i can"
+        ]
+        if blockedPrefixes.contains(where: { lowered.hasPrefix($0) }) {
+            return ""
+        }
+        let blockedFragments = [
+            "baptiste lefort",
+            "insert here",
+            "current text",
+            "continuation:",
+            "next words:",
+            "<cursor",
+            "<|im_",
+            "the user",
+            "as an ai",
+            "role:",
+            "**"
+        ]
+        if blockedFragments.contains(where: { lowered.contains($0) }) {
+            return ""
+        }
+        if cleaned.range(of: #"[\[\]\{\}\*]"#, options: .regularExpression) != nil {
+            return ""
+        }
+
+        let words = cleaned.split { $0.isWhitespace || $0.isNewline }
+        if words.isEmpty {
+            return ""
+        }
+        if words.count > 6 {
+            cleaned = words.prefix(6).joined(separator: " ")
+        }
+
+        let endsWithWhitespace = inputText.last?.isWhitespace ?? false
+        if !endsWithWhitespace, hadLeadingWhitespace, cleaned.first?.isLetter == true {
+            return " " + cleaned
+        }
+        return cleaned
+    }
+
+    private func currentInlineInput(from text: String) -> String {
+        let segments = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        if let last = segments.last {
+            return String(last)
+        }
+        return text
     }
 
     private func filteredWindowContext(_ context: WindowTextContext, inputText: String) -> WindowTextContext? {
@@ -727,14 +845,65 @@ class AppState: ObservableObject {
         publishDisabledApps()
     }
 
-    private func loadDefaultModelIfNeeded() {
-        guard FileManager.default.fileExists(atPath: defaultModelPath) else {
-            loadingStatus = "Default model not found at \(defaultModelPath)"
-            return
-        }
+    private func loadInitialModelIfNeeded() {
         Task {
-            await loadModel(path: defaultModelPath)
+            await ensureManagedModelLoaded()
         }
+    }
+
+    private func ensureManagedModelLoaded() async {
+        do {
+            let localURL = try await ensureManagedModelOnDisk()
+            await loadModel(path: localURL.path)
+        } catch {
+            loadingStatus = "Error preparing model: \(error.localizedDescription)"
+            isLoading = false
+            #if DEBUG
+            print("[Typofast] failed to prepare managed model: \(error)")
+            #endif
+        }
+    }
+
+    private func ensureManagedModelOnDisk() async throws -> URL {
+        let fileManager = FileManager.default
+        let appSupport = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let modelDirectory = appSupport
+            .appendingPathComponent("typofast", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+        try fileManager.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+
+        let modelURL = modelDirectory.appendingPathComponent(managedModelFilename, isDirectory: false)
+        #if DEBUG
+        print("[Typofast] managed model path=\"\(modelURL.path)\"")
+        #endif
+        if fileManager.fileExists(atPath: modelURL.path) {
+            #if DEBUG
+            print("[Typofast] found local managed model")
+            #endif
+            return modelURL
+        }
+
+        loadingStatus = "Downloading \(managedModelRepository)..."
+        isLoading = true
+        #if DEBUG
+        print("[Typofast] downloading model from \(managedModelRemoteURL.absoluteString)")
+        #endif
+        let (temporaryURL, response) = try await URLSession.shared.download(from: managedModelRemoteURL)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+
+        if fileManager.fileExists(atPath: modelURL.path) {
+            try fileManager.removeItem(at: modelURL)
+        }
+        try fileManager.moveItem(at: temporaryURL, to: modelURL)
+        return modelURL
     }
 
     private func persistDisabledApps() {
@@ -775,7 +944,8 @@ class AppState: ObservableObject {
     }
 
     var modelDisplayName: String {
-        URL(fileURLWithPath: modelPath ?? defaultModelPath).lastPathComponent
+        guard let modelPath else { return managedModelFilename }
+        return URL(fileURLWithPath: modelPath).lastPathComponent
     }
 
     private static let defaultDisabledApps: [String: String] = [
@@ -1049,9 +1219,15 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Typofast")
                     .font(.system(.title3, design: .rounded).weight(.semibold))
-                Text(appState.isLoading ? "Loading model..." : "Ready")
+                Text(headerStatusText)
                     .font(.system(.caption, design: .rounded))
                     .foregroundColor(.secondary)
+                if appState.engine == nil, !appState.loadingStatus.isEmpty {
+                    Text(appState.loadingStatus)
+                        .font(.system(size: 11, weight: .regular, design: .rounded))
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                }
             }
             Spacer()
             Image(systemName: "text.cursor")
@@ -1065,6 +1241,16 @@ struct ContentView: View {
             || appState.averageTtft > 0
             || appState.averageTokensPerSecond > 0
             || appState.averageCachedTokensReused > 0
+    }
+
+    private var headerStatusText: String {
+        if appState.isLoading {
+            return "Loading model..."
+        }
+        if appState.engine != nil {
+            return "Ready"
+        }
+        return "No model loaded"
     }
 
     private func promptPreview() -> String {
