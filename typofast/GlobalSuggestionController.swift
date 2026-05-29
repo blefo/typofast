@@ -328,9 +328,11 @@ final class GlobalSuggestionController: ObservableObject {
             return
         }
 
-        if context.caretRect == nil {
-            appState.updateWindowContext(nil)
-        }
+        // Do NOT clear the window context just because this refresh momentarily lacks a caret
+        // rect. applyFocusedContext runs on the 0.12s poll timer and on every keystroke, so a
+        // transient AX caret miss would otherwise wipe a conversation we just captured. Context
+        // is correctly invalidated on a real window/app change in updateWindowContextIfNeeded;
+        // that is what should scope it, not a one-frame caret gap.
         focusedContext = context
 
         let normalizedValue = context.value.map { normalizeObservedValue($0) }

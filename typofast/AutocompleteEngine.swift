@@ -14,14 +14,18 @@ struct CompletionMetrics {
 
 private struct SamplingConfig {
     var hardMaxTokens: Int = 64
-    // Greedy decoding: for inline autocomplete we want the single most-likely continuation.
-    // Sampling (even at low temperature) pulls in long-tail junk like random numbers, which
-    // a small quantized model is especially prone to. Greedy is also fully deterministic so
-    // the same prefix always yields the same suggestion (no flicker).
-    var temperature: Float = 0.0
-    var topK: Int32 = 0
-    var topP: Float = 1.0
-    var minP: Float = 0.0
+    // Low-temperature nucleus sampling. Greedy (temp=0) collapses a 1.2B base model onto the
+    // single most-frequent continuation, which for everyday phrases is number-heavy boilerplate
+    // ("…available " -> "24 hours a day", "Today " -> "1 in 3"). It is also fully deterministic,
+    // so the same prefix always returns the identical suggestion. A small temperature plus top-p/
+    // top-k/min-p truncation keeps the candidate set to coherent tokens while spreading mass off
+    // the clichéd argmax, which both improves prose quality and lets a fresh sample appear instead
+    // of the same boilerplate. The seed is fixed so a given prefix is stable (no flicker mid-word);
+    // variety across keystrokes comes from the prompt itself growing by a character each time.
+    var temperature: Float = 0.3
+    var topK: Int32 = 40
+    var topP: Float = 0.9
+    var minP: Float = 0.05
     var repeatPenalty: Float = 1.1
     var repeatLastN: Int32 = 64
     var seed: UInt32 = 0x9E3779B9
@@ -108,9 +112,14 @@ actor AutocompleteEngine {
     private var sampler: LlamaSamplerChain?
     private var tokenizeAddsBos = true
     private var contextCapacity = 2048
+    // Recurrent (SSM/hybrid) models can't partially roll back their state via
+    // clearSequence(from: n>0). We must hard-reset after each generation so the
+    // recurrent memory is fully cleared before the next prompt decode.
+    private var isRecurrentModel = false
 
-    func loadModel(path: String, addBos: Bool = true) async throws {
+    func loadModel(path: String, addBos: Bool = true, isRecurrent: Bool = false) async throws {
         tokenizeAddsBos = addBos
+        isRecurrentModel = isRecurrent
         try llama.loadModel(path: path)
         contextCapacity = max(512, llama.contextSize)
         let bannedIds = Array(Set(llama.eogTokenIds + llama.controlTokenIds))
@@ -190,7 +199,7 @@ actor AutocompleteEngine {
         metrics.promptProcessingTime = Date().timeIntervalSince(promptStart)
 
         guard generationId == self.generationId, !Task.isCancelled else {
-            _ = llama.clearSequence(seqId: seqId, from: Int32(promptLen))
+            if isRecurrentModel { hardResetCache() } else { _ = llama.clearSequence(seqId: seqId, from: Int32(promptLen)) }
             return ("", metrics)
         }
 
@@ -209,7 +218,7 @@ actor AutocompleteEngine {
 
         for step in 0..<maxOut {
             if generationId != self.generationId || Task.isCancelled {
-                _ = llama.clearSequence(seqId: seqId, from: Int32(promptLen))
+                if isRecurrentModel { hardResetCache() } else { _ = llama.clearSequence(seqId: seqId, from: Int32(promptLen)) }
                 return ("", metrics)
             }
 
@@ -244,8 +253,12 @@ actor AutocompleteEngine {
             }
         }
 
-        _ = llama.clearSequence(seqId: seqId, from: Int32(promptLen))
-        llama.clearInvalidBytes()
+        if isRecurrentModel {
+            hardResetCache()
+        } else {
+            _ = llama.clearSequence(seqId: seqId, from: Int32(promptLen))
+            llama.clearInvalidBytes()
+        }
 
         let generationTime = Date().timeIntervalSince(generationStart)
         metrics.totalTime = Date().timeIntervalSince(startTime)

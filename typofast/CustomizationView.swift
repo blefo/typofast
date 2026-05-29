@@ -7,9 +7,28 @@ struct CustomizationView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
+            modelSection
             personalizationSection
             lengthSection
             minWordsSection
+        }
+    }
+
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Model")
+                .font(.system(.callout, design: .rounded).weight(.semibold))
+            Picker("", selection: Binding(
+                get: { appState.selectedModel },
+                set: { appState.switchModel($0) }
+            )) {
+                ForEach(ModelConfig.all) { config in
+                    Text(config.displayName).tag(config)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .disabled(appState.isLoading)
         }
     }
 

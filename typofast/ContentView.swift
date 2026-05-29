@@ -8,6 +8,43 @@ enum TextChangeSource {
     case `internal`
 }
 
+struct ModelConfig: Identifiable, Equatable, Hashable {
+    let id: String
+    let displayName: String
+    let repository: String
+    let filename: String
+    let remoteURL: URL
+    let addBos: Bool
+    // Hybrid SSM/recurrent models (e.g. lfm2) can't partially roll back their
+    // recurrent state — we must hard-reset after each generation rather than
+    // using clearSequence(from: promptLen).
+    let isRecurrent: Bool
+}
+
+extension ModelConfig {
+    static let gemma4E2B = ModelConfig(
+        id: "gemma4e2b",
+        displayName: "Gemma 4 E2B",
+        repository: "mradermacher/gemma-4-E2B-i1-GGUF",
+        filename: "gemma-4-E2B.i1-Q4_K_M.gguf",
+        remoteURL: URL(string: "https://huggingface.co/mradermacher/gemma-4-E2B-i1-GGUF/resolve/main/gemma-4-E2B.i1-Q4_K_M.gguf?download=true")!,
+        addBos: true,
+        isRecurrent: false
+    )
+
+    static let lfm25 = ModelConfig(
+        id: "lfm25",
+        displayName: "LFM2.5 1.2B",
+        repository: "LiquidAI/LFM2.5-1.2B-Base-GGUF",
+        filename: "LFM2.5-1.2B-Base-Q4_K_M.gguf",
+        remoteURL: URL(string: "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Base-GGUF/resolve/main/LFM2.5-1.2B-Base-Q4_K_M.gguf?download=true")!,
+        addBos: true,
+        isRecurrent: true
+    )
+
+    static let all: [ModelConfig] = [.gemma4E2B, .lfm25]
+}
+
 /// Thread-safe atomic counter for tracking key presses across threads
 final class AtomicKeyPressCounter: @unchecked Sendable {
     private var _value: Int64 = 0
@@ -81,10 +118,8 @@ class AppState: ObservableObject {
     private let completionLengthKey = "typofast.completionLength"
     private let customInstructionsKey = "typofast.customInstructions"
     private let minWordsToSuggestKey = "typofast.minWordsToSuggest"
-    private let managedModelRepository = "mradermacher/gemma-4-E2B-i1-GGUF"
-    private let managedModelFilename = "gemma-4-E2B.i1-Q4_K_M.gguf"
-    private let managedModelRemoteURL = URL(string: "https://huggingface.co/mradermacher/gemma-4-E2B-i1-GGUF/resolve/main/gemma-4-E2B.i1-Q4_K_M.gguf?download=true")!
-    private let managedModelAddBos = true
+    @Published var selectedModel: ModelConfig = .gemma4E2B
+    private let selectedModelKey = "typofast.selectedModel"
     private let debounceDelayNs: UInt64 = 25_000_000
 
     init() {
@@ -93,6 +128,7 @@ class AppState: ObservableObject {
         loadDisabledApps()
         loadOcrContextEnabled()
         loadCompletionSettings()
+        loadSelectedModel()
         loadInitialModelIfNeeded()
         metricsObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("TypofastMetricsUpdate"),
@@ -227,17 +263,18 @@ class AppState: ObservableObject {
         persistAcceptanceStats()
     }
 
-    func loadModel(path: String, addBos: Bool = true) async {
+    func loadModel(path: String, addBos: Bool = true, isRecurrent: Bool = false) async {
         isLoading = true
         loadingStatus = "Loading model..."
 
         do {
             let engine = AutocompleteEngine()
-            try await engine.loadModel(path: path, addBos: addBos)
+            try await engine.loadModel(path: path, addBos: addBos, isRecurrent: isRecurrent)
             self.engine = engine
             self.modelPath = path
             UserDefaults.standard.set(path, forKey: "typofast.modelPath")
             UserDefaults.standard.set(addBos, forKey: "typofast.modelAddBos")
+            UserDefaults.standard.set(isRecurrent, forKey: "typofast.modelIsRecurrent")
             loadingStatus = "Model loaded successfully!"
             hasLoggedMissingEngine = false
             #if DEBUG
@@ -526,7 +563,13 @@ class AppState: ObservableObject {
         var prefix = ""
         let instructions = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         if !instructions.isEmpty {
-            prefix += instructions + "\n\n"
+            // A base model has no instruction-following, so the persona cannot steer "write like
+            // me". Glued in as raw first-person prose followed by a blank line ("I am Baptiste…\n\n"),
+            // it reads as the start of a passage the model then keeps writing — autobiographical
+            // drift, often number-heavy ("…26 years old" primes ages/quantities). Wrapping it as a
+            // bracketed, self-contained note (and dropping the paragraph gap) keeps it as background
+            // conditioning while the model continues the user's actual sentence rather than the bio.
+            prefix += "(Note about the writer: \(instructions))\n"
         }
         if !contextPrefix.isEmpty {
             let cleanedContext = stripHTMLTags(contextPrefix)
@@ -612,7 +655,12 @@ class AppState: ObservableObject {
     }
 
     private func filteredWindowContext(_ context: WindowTextContext, inputText: String) -> WindowTextContext? {
-        let maxAge: TimeInterval = context.source == .ocr ? 1.0 : 3.0
+        // The capture layer re-captures at most every 2s (GlobalSuggestionController) and already
+        // invalidates context the moment the focused window changes. A 1s expiry therefore threw
+        // away a perfectly good capture for most of every 2s cycle, so the conversation was absent
+        // from the prompt on the majority of keystrokes. Keep a capture alive long enough to bridge
+        // capture cycles and short reading pauses; window-change (not the clock) is what scopes it.
+        let maxAge: TimeInterval = context.source == .ocr ? 10.0 : 5.0
         guard context.isFresh(maxAge: maxAge) else { return nil }
         guard context.source == .ocr else { return context }
 
@@ -895,16 +943,33 @@ class AppState: ObservableObject {
         publishDisabledApps()
     }
 
-    private func loadInitialModelIfNeeded() {
+    func switchModel(_ config: ModelConfig) {
+        guard config != selectedModel || engine == nil else { return }
+        selectedModel = config
+        UserDefaults.standard.set(config.id, forKey: selectedModelKey)
+        engine = nil
         Task {
-            await ensureManagedModelLoaded()
+            await ensureManagedModelLoaded(config: config)
         }
     }
 
-    private func ensureManagedModelLoaded() async {
+    private func loadSelectedModel() {
+        if let savedId = UserDefaults.standard.string(forKey: selectedModelKey),
+           let config = ModelConfig.all.first(where: { $0.id == savedId }) {
+            selectedModel = config
+        }
+    }
+
+    private func loadInitialModelIfNeeded() {
+        Task {
+            await ensureManagedModelLoaded(config: selectedModel)
+        }
+    }
+
+    private func ensureManagedModelLoaded(config: ModelConfig) async {
         do {
-            let localURL = try await ensureManagedModelOnDisk()
-            await loadModel(path: localURL.path, addBos: managedModelAddBos)
+            let localURL = try await ensureManagedModelOnDisk(config: config)
+            await loadModel(path: localURL.path, addBos: config.addBos, isRecurrent: config.isRecurrent)
         } catch {
             loadingStatus = "Error preparing model: \(error.localizedDescription)"
             isLoading = false
@@ -914,7 +979,7 @@ class AppState: ObservableObject {
         }
     }
 
-    private func ensureManagedModelOnDisk() async throws -> URL {
+    private func ensureManagedModelOnDisk(config: ModelConfig) async throws -> URL {
         let fileManager = FileManager.default
         let appSupport = try fileManager.url(
             for: .applicationSupportDirectory,
@@ -927,7 +992,7 @@ class AppState: ObservableObject {
             .appendingPathComponent("models", isDirectory: true)
         try fileManager.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
 
-        let modelURL = modelDirectory.appendingPathComponent(managedModelFilename, isDirectory: false)
+        let modelURL = modelDirectory.appendingPathComponent(config.filename, isDirectory: false)
         #if DEBUG
         print("[Typofast] managed model path=\"\(modelURL.path)\"")
         #endif
@@ -938,12 +1003,12 @@ class AppState: ObservableObject {
             return modelURL
         }
 
-        loadingStatus = "Downloading \(managedModelRepository)..."
+        loadingStatus = "Downloading \(config.repository)..."
         isLoading = true
         #if DEBUG
-        print("[Typofast] downloading model from \(managedModelRemoteURL.absoluteString)")
+        print("[Typofast] downloading model from \(config.remoteURL.absoluteString)")
         #endif
-        let (temporaryURL, response) = try await URLSession.shared.download(from: managedModelRemoteURL)
+        let (temporaryURL, response) = try await URLSession.shared.download(from: config.remoteURL)
         if let httpResponse = response as? HTTPURLResponse,
            !(200...299).contains(httpResponse.statusCode) {
             throw URLError(.badServerResponse)
@@ -1010,7 +1075,7 @@ class AppState: ObservableObject {
     }
 
     var modelDisplayName: String {
-        guard let modelPath else { return managedModelFilename }
+        guard let modelPath else { return selectedModel.filename }
         return URL(fileURLWithPath: modelPath).lastPathComponent
     }
 

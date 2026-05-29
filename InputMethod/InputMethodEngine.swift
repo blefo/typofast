@@ -9,6 +9,7 @@ final class InputMethodEngine {
     private var loadingTask: Task<Void, Never>?
     private let modelPathKey = "typofast.modelPath"
     private let modelAddBosKey = "typofast.modelAddBos"
+    private let modelIsRecurrentKey = "typofast.modelIsRecurrent"
 
     private init() {}
 
@@ -23,7 +24,8 @@ final class InputMethodEngine {
             }
             do {
                 let addBos = UserDefaults.standard.object(forKey: modelAddBosKey) as? Bool ?? true
-                try await engine.loadModel(path: path, addBos: addBos)
+                let isRecurrent = UserDefaults.standard.bool(forKey: modelIsRecurrentKey)
+                try await engine.loadModel(path: path, addBos: addBos, isRecurrent: isRecurrent)
                 isLoaded = true
             } catch {
                 isLoaded = false
