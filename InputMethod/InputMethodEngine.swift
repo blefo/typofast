@@ -8,6 +8,7 @@ final class InputMethodEngine {
     private var isLoaded = false
     private var loadingTask: Task<Void, Never>?
     private let modelPathKey = "typofast.modelPath"
+    private let modelAddBosKey = "typofast.modelAddBos"
 
     private init() {}
 
@@ -21,7 +22,8 @@ final class InputMethodEngine {
                 return
             }
             do {
-                try await engine.loadModel(path: path)
+                let addBos = UserDefaults.standard.object(forKey: modelAddBosKey) as? Bool ?? true
+                try await engine.loadModel(path: path, addBos: addBos)
                 isLoaded = true
             } catch {
                 isLoaded = false
@@ -29,10 +31,10 @@ final class InputMethodEngine {
         }
     }
 
-    func getSuggestion(prompt: String, inputText: String) async -> (String, CompletionMetrics) {
+    func getSuggestion(prompt: String) async -> (String, CompletionMetrics) {
         await ensureLoaded()
         guard isLoaded else { return ("", CompletionMetrics()) }
-        let (completion, metrics) = await engine.getCompletion(prompt: prompt, inputText: inputText, maxTokens: 6)
+        let (completion, metrics) = await engine.getCompletion(prompt: prompt, maxTokens: 6)
         publishMetrics(metrics)
         return (completion, metrics)
     }

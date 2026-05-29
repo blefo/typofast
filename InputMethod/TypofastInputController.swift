@@ -125,21 +125,7 @@ final class TypofastInputController: IMKInputController {
             if ch.isWhitespace { break }
             length += 1
         }
-        return length >= 2
-    }
-
-    private func trimTrailingSpaces(_ text: String) -> String {
-        var end = text.endIndex
-        while end > text.startIndex {
-            let prev = text.index(before: end)
-            let ch = text[prev]
-            if ch == " " || ch == "\t" {
-                end = prev
-            } else {
-                break
-            }
-        }
-        return String(text[..<end])
+        return length > 0
     }
 
     private func sanitizeSuggestion(_ suggestion: String, forPrompt prompt: String) -> String {
@@ -247,14 +233,15 @@ final class TypofastInputController: IMKInputController {
             return
         }
 
-        let modelPrompt = trimTrailingSpaces(newText)
+        // Feed the raw text up to the caret (including the partial word) so the base model
+        // continues exactly from the cursor, enabling in-word completion.
         debounceTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: debounceDelayNs)
             guard !Task.isCancelled else { return }
             guard newText == currentText else { return }
             pendingTask?.cancel()
             pendingTask = Task { @MainActor in
-                let (completion, _) = await InputMethodEngine.shared.getSuggestion(prompt: modelPrompt, inputText: newText)
+                let (completion, _) = await InputMethodEngine.shared.getSuggestion(prompt: newText)
                 guard newText == currentText else { return }
                 let sanitized = sanitizeSuggestion(completion, forPrompt: newText)
                 suggestionBase = sanitized

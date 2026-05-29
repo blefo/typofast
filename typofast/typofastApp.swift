@@ -12,6 +12,13 @@ struct typofastApp: App {
     }
 }
 
+/// Borderless panels return `false` from `canBecomeKey` by default, which prevents text fields
+/// (the personalization editor) from receiving keyboard focus. Forcing it lets the settings UI
+/// be edited while keeping the panel non-activating during normal inline-suggestion use.
+final class SettingsPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let appState = AppState()
     private lazy var globalController = GlobalSuggestionController(appState: appState)
@@ -39,7 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupPanel() {
         let hostingView = NSHostingView(rootView: ContentView(appState: appState))
         let panelSize = NSSize(width: 320, height: 460)
-        let panel = NSPanel(
+        let panel = SettingsPanel(
             contentRect: NSRect(origin: .zero, size: panelSize),
             styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
             backing: .buffered,
@@ -54,7 +61,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.titlebarAppearsTransparent = true
         panel.collectionBehavior = [.transient, .canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
-        panel.becomesKeyOnlyIfNeeded = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.delegate = self
         panel.contentView = hostingView
         self.panel = panel
     }
@@ -66,7 +74,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         positionPanel(panel)
-        panel.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+}
+
+extension AppDelegate: NSWindowDelegate {
+    func windowDidResignKey(_ notification: Notification) {
+        panel?.orderOut(nil)
     }
 }
 

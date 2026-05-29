@@ -15,9 +15,9 @@ final class LlamaContext {
     private var context: OpaquePointer?
     private var vocab: OpaquePointer?
     private var temporaryInvalidBytes: [CChar] = []
-    private var contextParams: llama_context_params?
 
     private(set) var nVocab: Int32 = 0
+    private(set) var contextSize: Int = 2048
 
     deinit {
         cleanup()
@@ -81,7 +81,7 @@ final class LlamaContext {
             throw LlamaError.contextInitFailed
         }
         self.context = context
-        self.contextParams = ctxParams
+        self.contextSize = Int(ctxParams.n_ctx)
 
         if let info = llama_print_system_info() {
             print(String(cString: info))
@@ -89,10 +89,10 @@ final class LlamaContext {
         print("Model loaded. Vocab size: \(nVocab)")
     }
 
-    func tokenize(text: String, addBos: Bool) -> [Int32] {
+    func tokenize(text: String, addBos: Bool, special: Bool = false) -> [Int32] {
         guard let vocab = vocab else { return [] }
 
-        var maxTokens = max(512, text.utf8.count / 2)
+        var maxTokens = max(512, text.utf8.count + 32)
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: maxTokens)
 
         let textBytes = text.utf8CString
@@ -104,7 +104,7 @@ final class LlamaContext {
                 tokens,
                 Int32(maxTokens),
                 addBos,
-                false
+                special
             )
         }
 
@@ -122,7 +122,7 @@ final class LlamaContext {
                     resizedTokens,
                     Int32(maxTokens),
                     addBos,
-                    false
+                    special
                 )
             }
 
@@ -240,26 +240,6 @@ final class LlamaContext {
         return llama_memory_seq_rm(memory, seqId, from, -1)
     }
 
-    func resetContext() -> Bool {
-        guard let model = model, let params = contextParams else { return false }
-        if let context = context {
-            llama_free(context)
-            self.context = nil
-        }
-        guard let newContext = llama_new_context_with_model(model, params) else {
-            return false
-        }
-        self.context = newContext
-        temporaryInvalidBytes.removeAll()
-        return true
-    }
-
-    func copySequence(from src: Int32, to dst: Int32) {
-        guard let context = context else { return }
-        let memory = llama_get_memory(context)
-        llama_memory_seq_cp(memory, src, dst, 0, -1)
-    }
-
     func isEog(_ tokenId: Int32) -> Bool {
         guard let vocab = vocab else { return false }
         return llama_vocab_is_eog(vocab, tokenId)
@@ -272,5 +252,18 @@ final class LlamaContext {
 
     var rawContext: OpaquePointer? {
         context
+    }
+
+    var eogTokenIds: [Int32] {
+        guard let vocab = vocab else { return [] }
+        return (0..<nVocab).filter { llama_vocab_is_eog(vocab, $0) }
+    }
+
+    var controlTokenIds: [Int32] {
+        guard vocab != nil else { return [] }
+        return (0..<nVocab).filter {
+            let text = tokenToText($0)
+            return text.contains("<") || text.contains(">")
+        }
     }
 }

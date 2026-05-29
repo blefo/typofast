@@ -4,7 +4,7 @@ import Vision
 import ScreenCaptureKit
 
 final class WindowContextExtractor {
-    private let maxTokens = 200
+    private let maxTokens = 90
     private let textProcessor = OCRTextProcessor()
 
     func extract(frontmostApp: NSRunningApplication?,
@@ -141,17 +141,7 @@ final class WindowContextExtractor {
                 return nil
             }
 
-            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-            let filter: SCContentFilter
-            if let display = displayForWindow(window, content: content) {
-                filter = SCContentFilter(
-                    display: display,
-                    excludingApplications: [],
-                    exceptingWindows: [window]
-                )
-            } else {
-                filter = SCContentFilter(desktopIndependentWindow: window)
-            }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
             let configuration = SCStreamConfiguration()
             configuration.showsCursor = false
             configuration.capturesAudio = false
@@ -185,10 +175,10 @@ final class WindowContextExtractor {
             let caretCenterXInImage = caretXInWindow * scaleX
             let caretCenterYInImage = caretYInWindowFromTop * scaleY
 
-            let gap: CGFloat = 24 * scaleY
-            let minHeight: CGFloat = 120 * scaleY
-            let maxHeightAbove: CGFloat = 420 * scaleY
-            let maxHeightBelow: CGFloat = 320 * scaleY
+            let gap: CGFloat = 18 * scaleY
+            let minHeight: CGFloat = 60 * scaleY
+            let maxHeightAbove: CGFloat = 170 * scaleY
+            let maxHeightBelow: CGFloat = 90 * scaleY
 
             let regionTop: CGFloat
             let regionBottom: CGFloat
@@ -209,10 +199,10 @@ final class WindowContextExtractor {
 
             let centerXInImage = caretCenterXInImage
 
-            let referenceWidth = elementFrameInWindow?.width ?? (windowFrame.width * 0.45)
+            let referenceWidth = elementFrameInWindow?.width ?? (windowFrame.width * 0.4)
             let elementWidthInImage = referenceWidth * scaleX
-            let horizontalPadding: CGFloat = max(160 * scaleX, elementWidthInImage * 0.2)
-            let maxCaptureWidth: CGFloat = min(imageWidth, 980 * scaleX)
+            let horizontalPadding: CGFloat = max(90 * scaleX, elementWidthInImage * 0.15)
+            let maxCaptureWidth: CGFloat = min(imageWidth, 560 * scaleX)
             let targetWidth = min(maxCaptureWidth, elementWidthInImage + (horizontalPadding * 2))
             let regionLeft = max(0, min(imageWidth - targetWidth, centerXInImage - targetWidth / 2))
             let regionRight = min(imageWidth, regionLeft + targetWidth)
@@ -319,18 +309,6 @@ final class WindowContextExtractor {
         } catch {
             return nil
         }
-    }
-
-    @available(macOS 14.0, *)
-    private func displayForWindow(_ window: SCWindow, content: SCShareableContent) -> SCDisplay? {
-        let windowFrame = window.frame
-        for display in content.displays {
-            let displayBounds = CGDisplayBounds(display.displayID)
-            if displayBounds.intersects(windowFrame) {
-                return display
-            }
-        }
-        return nil
     }
 
     private func trimFromEnd(_ text: String) -> String {

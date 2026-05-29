@@ -50,7 +50,9 @@ class AppState: ObservableObject {
     @Published var suggestedWordsCount: Int = 0
     @Published var acceptedWordsCount: Int = 0
     @Published var ocrContextEnabled: Bool = true
-    @Published var systemPrompt: String = ""
+    @Published var completionLength: CompletionLength = .medium
+    @Published var customInstructions: String = ""
+    @Published var minWordsToSuggest: Int = 3
 
     private var inferenceTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
@@ -76,22 +78,21 @@ class AppState: ObservableObject {
     private let averageCachedTokensReusedKey = "typofast.averageCachedTokensReused"
     private let metricsSamplesKey = "typofast.metricsSamples"
     private let ocrContextEnabledKey = "typofast.ocrContextEnabled"
-    private let systemPromptKey = "typofast.systemPrompt"
-    private let managedModelRepository = "unsloth/gemma-4-E2B-it-GGUF"
-    private let managedModelFilename = "gemma-4-E2B-it-Q4_K_M.gguf"
-    private let managedModelRemoteURL = URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf?download=true")!
-    private let defaultSystemPrompt = """
-        User context: My name is Baptiste Lefort. I usually write in English and French.
-        Write causally with low ponctuation (I espcially rarely use commas). Keep your sentences short, concise and readable.
-        """
-    private let debounceDelayNs: UInt64 = 120_000_000
+    private let completionLengthKey = "typofast.completionLength"
+    private let customInstructionsKey = "typofast.customInstructions"
+    private let minWordsToSuggestKey = "typofast.minWordsToSuggest"
+    private let managedModelRepository = "mradermacher/gemma-4-E2B-i1-GGUF"
+    private let managedModelFilename = "gemma-4-E2B.i1-Q4_K_M.gguf"
+    private let managedModelRemoteURL = URL(string: "https://huggingface.co/mradermacher/gemma-4-E2B-i1-GGUF/resolve/main/gemma-4-E2B.i1-Q4_K_M.gguf?download=true")!
+    private let managedModelAddBos = true
+    private let debounceDelayNs: UInt64 = 25_000_000
 
     init() {
         loadAcceptanceStats()
         loadPerformanceStats()
         loadDisabledApps()
         loadOcrContextEnabled()
-        loadSystemPrompt()
+        loadCompletionSettings()
         loadInitialModelIfNeeded()
         metricsObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("TypofastMetricsUpdate"),
@@ -226,15 +227,17 @@ class AppState: ObservableObject {
         persistAcceptanceStats()
     }
 
-    func loadModel(path: String) async {
+    func loadModel(path: String, addBos: Bool = true) async {
         isLoading = true
         loadingStatus = "Loading model..."
 
         do {
             let engine = AutocompleteEngine()
-            try await engine.loadModel(path: path)
+            try await engine.loadModel(path: path, addBos: addBos)
             self.engine = engine
             self.modelPath = path
+            UserDefaults.standard.set(path, forKey: "typofast.modelPath")
+            UserDefaults.standard.set(addBos, forKey: "typofast.modelAddBos")
             loadingStatus = "Model loaded successfully!"
             hasLoggedMissingEngine = false
             #if DEBUG
@@ -361,31 +364,7 @@ class AppState: ObservableObject {
             return
         }
 
-        debounceTask = Task { @MainActor in
-            guard !Task.isCancelled else { return }
-            try? await Task.sleep(nanoseconds: debounceDelayNs)
-            guard !Task.isCancelled else { return }
-            guard currentText == newText else { return }
-            if newText == lastRequestedInput { return }
-            if hasValidSuggestion(for: newText) { return }
-            if lastEmptyCompletionInput == newText { return }
-            isGenerating = true
-            lastRequestedInput = newText
-            let requestStart = CFAbsoluteTimeGetCurrent()
-            inferenceTask?.cancel()
-            inferenceTask = Task { @MainActor in
-                let requestId = UUID()
-                inFlightRequestId = requestId
-                await requestCompletion(newText, requestId: requestId)
-            }
-            await inferenceTask?.value
-            let requestEnd = CFAbsoluteTimeGetCurrent()
-            isGenerating = false
-            logEvent("timing.requestCompletion", [
-                "durationMs": String(format: "%.2f", (requestEnd - requestStart) * 1000.0),
-                "textLength": "\(newText.count)"
-            ])
-        }
+        enqueueCompletion(for: newText)
 
         let changeEnd = CFAbsoluteTimeGetCurrent()
         logEvent("timing.onTextChange", [
@@ -394,28 +373,65 @@ class AppState: ObservableObject {
         ])
     }
 
+    private func enqueueCompletion(for text: String) {
+        debounceTask?.cancel()
+        debounceTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(nanoseconds: debounceDelayNs)
+            guard !Task.isCancelled else { return }
+            guard currentText == text else { return }
+            if text == lastRequestedInput { return }
+            if hasValidSuggestion(for: text) { return }
+            if lastEmptyCompletionInput == text { return }
+            isGenerating = true
+            lastRequestedInput = text
+            let requestStart = CFAbsoluteTimeGetCurrent()
+            inferenceTask?.cancel()
+            inferenceTask = Task { @MainActor in
+                let requestId = UUID()
+                inFlightRequestId = requestId
+                await requestCompletion(text, requestId: requestId)
+            }
+            await inferenceTask?.value
+            let requestEnd = CFAbsoluteTimeGetCurrent()
+            isGenerating = false
+            logEvent("timing.requestCompletion", [
+                "durationMs": String(format: "%.2f", (requestEnd - requestStart) * 1000.0),
+                "textLength": "\(text.count)"
+            ])
+        }
+    }
+
+    private func enqueueCompletionAfterAccept(for text: String) {
+        guard engine != nil else { return }
+        let currentLine = currentInlineInput(from: text).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !currentLine.isEmpty else { return }
+
+        lastRequestedInput = ""
+        lastEmptyCompletionInput = nil
+        logEvent("completionAfterAccept", ["textLength": "\(text.count)"])
+        enqueueCompletion(for: text)
+    }
+
     private func requestCompletion(_ text: String, requestId: UUID) async {
         guard let engine = engine else { return }
 
-        // Capture the key press counter at request start
-        // If any key is pressed during the request, this counter will change
-        // This is atomic and can be updated from the event tap thread synchronously
-        let startKeyCount = keyPressCounter.value
-        let startChangeCounter = textChangeCounter
-
-        let trimmedText = trimTrailingSpaces(text)
-        var contextBlock = ""
-        if let context = windowContext,
-           let filteredContext = filteredWindowContext(context, inputText: trimmedText),
+        // Feed the raw text up to the caret (including the partial word being typed) so the
+        // base model continues exactly from the cursor. This is what makes in-word completion
+        // work: typing "thi" yields a continuation like "nk it's", not a misaligned next word.
+        var contextPrefix = ""
+        if ocrContextEnabled,
+           let context = windowContext,
+           let filteredContext = filteredWindowContext(context, inputText: trimTrailingSpaces(text)),
            !filteredContext.text.isEmpty {
-            contextBlock = filteredContext.promptBlock(maxTextLength: 1200)
+            contextPrefix = filteredContext.clippedText(maxLength: 600)
             logEvent("contextUsed", [
                 "source": filteredContext.source.rawValue,
                 "len": "\(filteredContext.text.count)",
                 "title": filteredContext.windowTitle ?? ""
             ])
         }
-        let modelPrompt = buildCompletionPrompt(text: text, contextBlock: contextBlock)
+        let modelPrompt = buildCompletionPrompt(text: text, contextPrefix: contextPrefix)
         logEvent("requestCompletion", [
             "text": text,
             "modelPrompt": modelPrompt
@@ -423,35 +439,28 @@ class AppState: ObservableObject {
         let generationStart = CFAbsoluteTimeGetCurrent()
         let (completion, completionMetrics) = await engine.getCompletion(
             prompt: modelPrompt,
-            inputText: text,
-            maxTokens: 10
+            maxWords: completionLength.wordCount
         )
 
-        // Check if this request was cancelled while waiting
         guard !Task.isCancelled else { return }
         guard inFlightRequestId == requestId else { return }
 
-        // Check if any key was pressed during the request
-        // The atomic counter is updated synchronously from the event tap callback thread,
-        // so this check is reliable without any timing delays
-        let currentKeyCount = keyPressCounter.value
-        guard currentKeyCount == startKeyCount else {
+        guard currentText.hasPrefix(text) else {
             #if DEBUG
-            print("[Typofast] discarding completion: keyCount changed from \(startKeyCount) to \(currentKeyCount)")
+            print("[Typofast] discarding completion: text diverged from request prefix")
             #endif
             return
         }
-        guard textChangeCounter == startChangeCounter else {
-            #if DEBUG
-            print("[Typofast] discarding completion: text changed during request")
-            #endif
-            return
-        }
-        guard currentText == text else {
-            #if DEBUG
-            print("[Typofast] discarding completion: currentText drifted from request text")
-            #endif
-            return
+
+        let typedSinceRequest = String(currentText.dropFirst(text.count))
+        if !typedSinceRequest.isEmpty {
+            let sanitizedPreview = sanitizeCompletion(completion, inputText: text)
+            if sanitizedPreview.isEmpty || !sanitizedPreview.hasPrefix(typedSinceRequest) {
+                #if DEBUG
+                print("[Typofast] discarding completion: typed chars do not align with suggestion")
+                #endif
+                return
+            }
         }
 
         let generationEnd = CFAbsoluteTimeGetCurrent()
@@ -463,19 +472,29 @@ class AppState: ObservableObject {
         ])
 
         let sanitizedCompletion = sanitizeCompletion(completion, inputText: text)
-        lastAppliedSuggestion = sanitizedCompletion
+
+        // When the new continuation is empty, keep the suggestion that is already on screen instead
+        // of clearing it. This gives the Cotypist-style feel where the user always has something to
+        // accept; the stale suggestion is replaced as soon as a fresh, non-empty one arrives and is
+        // realigned/cleared by the keep-suggestion logic in onTextChange as they keep typing.
         if sanitizedCompletion.isEmpty {
             lastEmptyCompletionInput = text
-        } else {
-            lastEmptyCompletionInput = nil
+            logEvent("completionReceived", [
+                "raw": completion,
+                "sanitized": "",
+                "kept": suggestion
+            ])
+            applyMetrics(completionMetrics)
+            return
         }
+
+        lastAppliedSuggestion = sanitizedCompletion
+        lastEmptyCompletionInput = nil
         suggestionBase = sanitizedCompletion
-        suggestionOffset = 0
-        suggestion = sanitizedCompletion
-        suggestionAnchor = text
-        if !sanitizedCompletion.isEmpty {
-            addSuggestedWords(from: sanitizedCompletion)
-        }
+        suggestionOffset = min(typedSinceRequest.count, sanitizedCompletion.count)
+        suggestion = String(sanitizedCompletion.dropFirst(suggestionOffset))
+        suggestionAnchor = currentText
+        addSuggestedWords(from: sanitizedCompletion)
         logEvent("completionReceived", [
             "raw": completion,
             "sanitized": sanitizedCompletion
@@ -486,97 +505,102 @@ class AppState: ObservableObject {
         applyMetrics(completionMetrics)
     }
 
-    private func buildCompletionPrompt(text: String, contextBlock: String) -> String {
-        let stylePrompt = (systemPrompt.isEmpty ? defaultSystemPrompt : systemPrompt)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let inlineInput = currentInlineInput(from: text)
-        var prompt = "\(stylePrompt)\n\n"
-        if !contextBlock.isEmpty {
-            prompt += "\(contextBlock)\n\n"
+    private func stripHTMLTags(_ input: String) -> String {
+        // Fast inline stripper – removes <tag> and </tag> patterns, decodes common entities
+        var result = input
+        while let range = result.range(of: "<[^>]+>", options: .regularExpression) {
+            result.replaceSubrange(range, with: " ")
         }
-        prompt += inlineInput
-        return prompt
+        result = result
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+        // Collapse whitespace runs created by tag removal
+        result = result.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func buildCompletionPrompt(text: String, contextPrefix: String) -> String {
+        var prefix = ""
+        let instructions = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !instructions.isEmpty {
+            prefix += instructions + "\n\n"
+        }
+        if !contextPrefix.isEmpty {
+            let cleanedContext = stripHTMLTags(contextPrefix)
+            if !cleanedContext.isEmpty {
+                prefix += cleanedContext.hasSuffix("\n") ? cleanedContext : cleanedContext + "\n"
+            }
+        }
+        guard !prefix.isEmpty else { return text }
+        return prefix + text
+    }
+
+    /// Turns the raw model continuation into ghost text that aligns with the caret.
+    ///
+    /// Leading whitespace is preserved as the natural word separator EXCEPT when the input
+    /// already ends with a space (then it is dropped so the ghost glues after the existing
+    /// space). This means:
+    /// - mid-word + letter continuation  → glued in-word completion ("thi" + "nk it's")
+    /// - mid-word + space continuation    → next-word suggestion     ("What" + " is the best")
+    /// - after a space                    → next word, space trimmed  ("What " + "is the best")
     private func sanitizeCompletion(_ raw: String, inputText: String) -> String {
         guard !raw.isEmpty else { return "" }
+        if raw.contains("<") || raw.contains(">") || raw.contains("**") { return "" }
 
-        let hadLeadingWhitespace = raw.first?.isWhitespace == true
         var cleaned = raw
-            .replacingOccurrences(of: "\\n", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\t", with: " ")
-
-        cleaned = String(cleaned.unicodeScalars.filter { scalar in
-            !CharacterSet.controlCharacters.contains(scalar)
-        })
-
-        cleaned = cleaned.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`.,;:!?()[]{}<>/\\"))
+        if let newline = cleaned.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
+            cleaned = String(cleaned[..<newline])
+        }
+        cleaned = String(cleaned.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
         guard !cleaned.isEmpty else { return "" }
+
+        let endsWithWhitespace = inputText.last?.isWhitespace ?? false
+        let leadingSpace = !endsWithWhitespace && (cleaned.first == " " || cleaned.first == "\t")
+        let body = trimLeadingWhitespace(cleaned)
+        guard !body.isEmpty else { return "" }
+
+        let words = body.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard !words.isEmpty else { return "" }
+
+        var limited = String(body)
+
+        // Drop content-free continuations made only of punctuation/symbols ("-", "•", "​").
+        let hasAlphanumeric = limited.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
+        guard hasAlphanumeric else { return "" }
+
+        // Reject continuations that just echo the personalization back (the base model regenerates
+        // the primed persona from its start when it has nothing better to continue).
+        if echoesPersonalization(limited) { return "" }
 
         let inputLine = trimTrailingSpaces(currentInlineInput(from: inputText))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !inputLine.isEmpty {
-            if cleaned == inputLine {
-                return ""
-            }
-            if cleaned.hasPrefix(inputLine + " ") {
-                cleaned = String(cleaned.dropFirst(inputLine.count))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`.,;:!?()[]{}<>/\\"))
-                guard !cleaned.isEmpty else { return "" }
-            }
-        }
+        if !inputLine.isEmpty, limited == inputLine { return "" }
 
-        let lowered = cleaned.lowercased()
-        let blockedPrefixes = [
-            "assistant:",
-            "user:",
-            "system:",
-            "okay, so",
-            "here is",
-            "here's",
-            "i can"
-        ]
-        if blockedPrefixes.contains(where: { lowered.hasPrefix($0) }) {
-            return ""
+        if leadingSpace {
+            limited = " " + limited
         }
-        let blockedFragments = [
-            "baptiste lefort",
-            "insert here",
-            "current text",
-            "continuation:",
-            "next words:",
-            "<cursor",
-            "<|im_",
-            "the user",
-            "as an ai",
-            "role:",
-            "**"
-        ]
-        if blockedFragments.contains(where: { lowered.contains($0) }) {
-            return ""
-        }
-        if cleaned.range(of: #"[\[\]\{\}\*]"#, options: .regularExpression) != nil {
-            return ""
-        }
+        return limited
+    }
 
-        let words = cleaned.split { $0.isWhitespace || $0.isNewline }
-        if words.isEmpty {
-            return ""
-        }
-        if words.count > 6 {
-            cleaned = words.prefix(6).joined(separator: " ")
-        }
+    private func echoesPersonalization(_ completion: String) -> Bool {
+        let persona = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard persona.count >= 4 else { return false }
+        let normalizedPersona = normalizeLine(persona)
+        let normalizedCompletion = normalizeLine(completion)
+        guard normalizedCompletion.count >= 3, !normalizedPersona.isEmpty else { return false }
+        return normalizedPersona.hasPrefix(normalizedCompletion)
+            || normalizedCompletion.hasPrefix(normalizedPersona)
+    }
 
-        let endsWithWhitespace = inputText.last?.isWhitespace ?? false
-        if !endsWithWhitespace, hadLeadingWhitespace, cleaned.first?.isLetter == true {
-            return " " + cleaned
+    private func trimLeadingWhitespace(_ text: String) -> String {
+        var start = text.startIndex
+        while start < text.endIndex, text[start].isWhitespace {
+            start = text.index(after: start)
         }
-        return cleaned
+        return String(text[start...])
     }
 
     private func currentInlineInput(from text: String) -> String {
@@ -600,6 +624,7 @@ class AppState: ObservableObject {
         let filteredLines = context.text
             .split(separator: "\n", omittingEmptySubsequences: false)
             .filter { line in
+                guard isUsefulContextLine(String(line)) else { return false }
                 let normalizedLine = normalizeLine(String(line))
                 guard !normalizedLine.isEmpty else { return false }
                 return !normalizedInputLines.contains { inputLine in
@@ -618,6 +643,17 @@ class AppState: ObservableObject {
             text: filteredText,
             capturedAt: context.capturedAt
         )
+    }
+
+    /// Drops OCR garbage lines (single short tokens like "sday"/"rday", lone symbols) that carry no
+    /// usable context and only mislead the base model when the typed text is short.
+    private func isUsefulContextLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 3 else { return false }
+        let letters = trimmed.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        guard letters >= 3 else { return false }
+        let words = trimmed.split { $0.isWhitespace }
+        return words.count >= 2 || trimmed.count >= 6
     }
 
     private func normalizeLines(_ text: String) -> [String] {
@@ -709,6 +745,10 @@ class AppState: ObservableObject {
         suppressNextInference = true
         currentText = newText
         lastText = newText
+
+        if suggestion.isEmpty, suggestionBase.isEmpty {
+            enqueueCompletionAfterAccept(for: newText)
+        }
     }
 
     func regenerateAfterDeletingAcceptedSuggestion(newText: String) {
@@ -815,16 +855,26 @@ class AppState: ObservableObject {
     }
 
     private func shouldTriggerCompletion(_ text: String) -> Bool {
-        // V0 logic: only trigger after at least one completed word (word + whitespace)
-        var inWord = false
-        for ch in text {
-            if ch.isWhitespace {
-                if inWord { return true }
-            } else {
-                inWord = true
-            }
+        let trimmed = trimTrailingSpaces(text)
+        if trimmed.isEmpty { return false }
+
+        // Never fire on a blank current line. With nothing to continue on this line the base model
+        // falls back to regenerating the primed prefix (the personalization / surrounding context),
+        // which is what produced the "I am Baptiste" echoes seen on empty Obsidian lines.
+        let currentLine = currentInlineInput(from: text).trimmingCharacters(in: .whitespacesAndNewlines)
+        if currentLine.isEmpty { return false }
+
+        let wordCount = currentLine.split { $0.isWhitespace }.count
+        if wordCount < minWordsToSuggest { return false }
+
+        if text.last?.isWhitespace == true { return true }
+
+        var activeWordLength = 0
+        for ch in trimmed.reversed() {
+            if ch.isWhitespace { break }
+            activeWordLength += 1
         }
-        return false
+        return activeWordLength > 0
     }
 
     func clearAll() async {
@@ -854,7 +904,7 @@ class AppState: ObservableObject {
     private func ensureManagedModelLoaded() async {
         do {
             let localURL = try await ensureManagedModelOnDisk()
-            await loadModel(path: localURL.path)
+            await loadModel(path: localURL.path, addBos: managedModelAddBos)
         } catch {
             loadingStatus = "Error preparing model: \(error.localizedDescription)"
             isLoading = false
@@ -930,17 +980,33 @@ class AppState: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: ocrContextEnabledKey)
     }
 
-    private func loadSystemPrompt() {
-        if let saved = UserDefaults.standard.string(forKey: systemPromptKey), !saved.isEmpty {
-            systemPrompt = saved
+    private func loadCompletionSettings() {
+        if let raw = UserDefaults.standard.string(forKey: completionLengthKey),
+           let value = CompletionLength(rawValue: raw) {
+            completionLength = value
+        }
+        customInstructions = UserDefaults.standard.string(forKey: customInstructionsKey) ?? ""
+        if UserDefaults.standard.object(forKey: minWordsToSuggestKey) == nil {
+            minWordsToSuggest = 3
         } else {
-            systemPrompt = defaultSystemPrompt
+            minWordsToSuggest = max(1, min(8, UserDefaults.standard.integer(forKey: minWordsToSuggestKey)))
         }
     }
 
-    func setSystemPrompt(_ prompt: String) {
-        systemPrompt = prompt
-        UserDefaults.standard.set(prompt, forKey: systemPromptKey)
+    func setCompletionLength(_ length: CompletionLength) {
+        completionLength = length
+        UserDefaults.standard.set(length.rawValue, forKey: completionLengthKey)
+    }
+
+    func setCustomInstructions(_ text: String) {
+        customInstructions = text
+        UserDefaults.standard.set(text, forKey: customInstructionsKey)
+    }
+
+    func setMinWordsToSuggest(_ count: Int) {
+        let clamped = max(1, min(8, count))
+        minWordsToSuggest = clamped
+        UserDefaults.standard.set(clamped, forKey: minWordsToSuggestKey)
     }
 
     var modelDisplayName: String {
@@ -964,7 +1030,6 @@ struct DisabledAppEntry: Identifiable, Hashable {
 
 struct ContentView: View {
     @ObservedObject var appState: AppState
-    @State private var isEditingPrompt = false
     @State private var isEditingRestrictions = false
     @State private var runningApps: [(bundleId: String, name: String)] = []
 
@@ -977,6 +1042,9 @@ struct ContentView: View {
         let smallTileHeight: CGFloat = 80
 
         return VStack(spacing: tileSpacing) {
+            PermissionsBanner()
+                .frame(width: contentWidth)
+
             // Row 1: Header + TTFT
             HStack(spacing: tileSpacing) {
                 tileView(backgroundColor: statusTileColor()) {
@@ -1048,44 +1116,9 @@ struct ContentView: View {
                 .frame(width: columnWidth, height: smallTileHeight)
             }
 
-            // Row 4: About you
+            // Row 4: Customization
             tileView {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "text.bubble")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Text("About you")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Toggle(isOn: $isEditingPrompt) {
-                            Label("Edit", systemImage: "pencil.line")
-                        }
-                        .toggleStyle(.button)
-                        .controlSize(.small)
-                    }
-
-                    if isEditingPrompt {
-                        TextEditor(text: Binding(
-                            get: { appState.systemPrompt },
-                            set: { appState.setSystemPrompt($0) }
-                        ))
-                        .font(.system(.callout, design: .rounded))
-                        .frame(height: 80)
-                        .scrollContentBackground(.hidden)
-                        .padding(6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(Color(NSColor.textBackgroundColor))
-                        )
-                    } else {
-                        Text(promptPreview())
-                            .font(.system(.callout, design: .rounded))
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
-                    }
-                }
+                CustomizationView(appState: appState)
             }
             .frame(width: contentWidth)
 
@@ -1251,14 +1284,6 @@ struct ContentView: View {
             return "Ready"
         }
         return "No model loaded"
-    }
-
-    private func promptPreview() -> String {
-        let trimmed = appState.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            return "No system prompt set"
-        }
-        return trimmed
     }
 
     private func formatNumber(_ num: Int) -> String {

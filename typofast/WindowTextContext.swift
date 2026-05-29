@@ -17,16 +17,8 @@ struct WindowTextContext {
         Date().timeIntervalSince(capturedAt) <= maxAge
     }
 
-    func promptBlock(maxTextLength: Int) -> String {
-        let clipped = WindowTextContext.trim(text, maxLength: maxTextLength)
-        let title = windowTitle?.isEmpty == false ? windowTitle! : "Unknown"
-        return """
-        Window context (source: \(source.rawValue)):
-        App: \(appName)
-        Window: \(title)
-        Visible text:
-        \(clipped)
-        """
+    func clippedText(maxLength: Int) -> String {
+        WindowTextContext.trim(text, maxLength: maxLength)
     }
 
     private static func trim(_ text: String, maxLength: Int) -> String {

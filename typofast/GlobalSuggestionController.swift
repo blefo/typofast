@@ -47,6 +47,7 @@ final class GlobalSuggestionController: ObservableObject {
     private var lastWindowContextKey: String = ""
     private var windowContextTask: Task<Void, Never>?
     private var lastWindowContextCaptureTime: CFAbsoluteTime = 0
+    private var lastWindowContextLog: String = ""
     private var workspaceObserver: NSObjectProtocol?
     private var cancellables = Set<AnyCancellable>()
 
@@ -440,9 +441,16 @@ final class GlobalSuggestionController: ObservableObject {
             return
         }
 
+        guard appState.ocrContextEnabled else {
+            appState.updateWindowContext(nil)
+            logWindowContext("capture skipped ocr-disabled")
+            return
+        }
+
         screenRecordingEnabled = Self.hasScreenRecordingPermission()
         guard screenRecordingEnabled else {
             appState.updateWindowContext(nil)
+            logWindowContext("capture skipped no-screen-recording-permission")
             return
         }
 
@@ -1465,6 +1473,8 @@ final class GlobalSuggestionController: ObservableObject {
 
     private func logWindowContext(_ message: String) {
         #if DEBUG
+        guard message != lastWindowContextLog else { return }
+        lastWindowContextLog = message
         print("[Typofast] context \(message)")
         #endif
     }
